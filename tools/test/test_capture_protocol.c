@@ -1,0 +1,38 @@
+#include <assert.h>
+#include <stdio.h>
+#include "capture_protocol.h"
+
+int main(void)
+{
+    assert(dk_crc((const uint8_t *)"123456789", 9) == 0x29b1);
+    const uint8_t lengths[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
+    for (size_t l = 0; l < sizeof(lengths); l++) {
+        for (unsigned pattern = 0; pattern < 256; pattern++) {
+            uint8_t raw[DK_MAX_RAW] = {1, DK_FRAME, 1, 1};
+            uint8_t decoded[DK_MAX_RAW], wire[DK_MAX_WIRE];
+            raw[3] |= lengths[l] > 8 ? 12 : 0;
+            dk_put(raw + 4, 0x12345678, 4);
+            dk_put(raw + 8, 0xffffffff, 4);
+            dk_put(raw + 12, 0x100000000ULL + pattern, 8);
+            dk_put(raw + 20, 0x1fffffff, 4);
+            raw[24] = lengths[l];
+            memset(raw + 25, pattern, raw[24]);
+            size_t n = dk_encode(raw, 25 + raw[24], wire);
+            assert(n <= DK_MAX_WIRE && wire[n - 1] == 0);
+            assert(dk_decode(wire, n - 1, decoded) == 27u + raw[24]);
+            assert(memcmp(raw, decoded, 27 + raw[24]) == 0);
+            for (size_t i = 0; i < n - 1; i++) {
+                wire[i] ^= 1;
+                assert(dk_decode(wire, n - 1, decoded) == 0);
+                wire[i] ^= 1;
+            }
+        }
+    }
+    uint8_t raw[DK_MAX_RAW] = {1, DK_STATUS, 0, 0};
+    uint8_t decoded[DK_MAX_RAW], wire[DK_MAX_WIRE];
+    assert(dk_encode(raw, 32, wire) == 36);
+    assert(dk_decode(wire, 35, decoded) == 34);
+    assert(dk_decode(wire, 34, decoded) == 0);
+    assert(dk_decode(wire, 0, decoded) == 0);
+    puts("Capture protocol: 4096 frame roundtrips, single-bit corruption, status and truncation passed");
+}

@@ -1,5 +1,8 @@
 #include "can_manager.h"
 #include "can_filter.h"
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+#include "usb_capture.h"
+#endif
 #include "automation_manager.h"
 #include "vehicle_control.h"
 #include "dbc.h"
@@ -24,6 +27,9 @@ static QueueHandle_t    s_rx_queue = NULL;
 static void on_frame_received(const can_tagged_frame_t *frame, void *user_ctx)
 {
     (void)user_ctx;
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    usb_capture_submit(frame);
+#else
     if (!s_rx_queue) return;
     // Feed the DBC value cache first so automation on_frame handlers (which read
     // signals via can_get) observe this frame's current contents.
@@ -41,10 +47,14 @@ static void on_frame_received(const can_tagged_frame_t *frame, void *user_ctx)
     stamped.timestamp_us = (uint32_t)esp_timer_get_time();
     // Drop frame if queue is full rather than blocking the driver
     xQueueSend(s_rx_queue, &stamped, 0);
+#endif
 }
 
 esp_err_t can_manager_init(void)
 {
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    return usb_capture_init();
+#else
     s_rx_queue = xQueueCreate(RX_QUEUE_DEPTH, sizeof(can_tagged_frame_t));
     if (!s_rx_queue) {
         return ESP_ERR_NO_MEM;
@@ -52,6 +62,7 @@ esp_err_t can_manager_init(void)
     s_iface_count = 0;
     ESP_LOGI(TAG, "CAN manager initialized (queue depth=%d)", RX_QUEUE_DEPTH);
     return ESP_OK;
+#endif
 }
 
 esp_err_t can_manager_add_interface(can_interface_t *iface)
@@ -101,6 +112,9 @@ esp_err_t can_manager_receive(can_tagged_frame_t *frame, uint32_t timeout_ms)
 
 esp_err_t can_manager_send(uint8_t bus_id, const can_frame_t *frame)
 {
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     if (!frame) return ESP_ERR_INVALID_ARG;
     for (int i = 0; i < s_iface_count; i++) {
         if (s_interfaces[i]->bus_id == bus_id) {

@@ -23,7 +23,7 @@
 #include "freertos/task.h"
 #include <string.h>
 
-#if !defined(CONFIG_BT_NIMBLE_NVS_PERSIST) || (CONFIG_BT_NIMBLE_NVS_PERSIST != 1)
+#if !defined(CONFIG_DASHKIT_USB_CAPTURE) && (!defined(CONFIG_BT_NIMBLE_NVS_PERSIST) || (CONFIG_BT_NIMBLE_NVS_PERSIST != 1))
 #error "CONFIG_BT_NIMBLE_NVS_PERSIST must be enabled (bonds would be RAM-only)"
 #endif
 
@@ -56,6 +56,7 @@ static void mark_app_valid_cb(void *arg)
     }
 }
 
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
 #define BLE_BATCH_MAX_FRAMES  16
 #define BLE_BATCH_TIMEOUT_MS  20
 
@@ -135,13 +136,17 @@ static void can_to_ble_task(void *arg)
     }
 }
 
+#endif
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "DashKit firmware starting... (reset reason=%d)",
              (int)esp_reset_reason());
 
+    esp_err_t err;
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
     // Initialize NVS (required for BLE)
-    esp_err_t err = nvs_flash_init();
+    err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         // Erases the bond store: a bonded phone then hits the iOS stale-bond wall
         // and can't re-pair to this address on its own. Loud on purpose.
@@ -151,12 +156,14 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+#endif
 
     ESP_ERROR_CHECK(led_init());
     led_set_color(LED_COLOR_BLUE);
 
     ESP_ERROR_CHECK(can_manager_init());
 
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
     ESP_ERROR_CHECK(can_filter_init());
 
     dbc_init();
@@ -164,6 +171,7 @@ void app_main(void)
     ESP_ERROR_CHECK(automation_manager_init());
 
     ESP_ERROR_CHECK(vehicle_control_init());
+#endif
 
     // CAN interface 0 (MCP2518FD)
     mcp251xfd_config_t can0_cfg = {
@@ -217,6 +225,7 @@ void app_main(void)
         return;
     }
 
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
     // BLE
     ESP_ERROR_CHECK(ble_server_init());
     ESP_ERROR_CHECK(ble_ota_init());
@@ -237,6 +246,8 @@ void app_main(void)
 
     // Bridge task: CAN -> BLE
     xTaskCreatePinnedToCore(can_to_ble_task, "can2ble", 8192, NULL, 5, NULL, 0);
+
+#endif
 
     ESP_LOGI(TAG, "DashKit firmware ready");
 

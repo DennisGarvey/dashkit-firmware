@@ -8,6 +8,14 @@
 # BLE central role from the build, so the stack stays exactly as a
 # dashboard-only device expects it.
 menu "DashKit"
+    config DASHKIT_USB_CAPTURE
+        bool "Passive USB CAN capture"
+        default n
+        help
+            Accept all standard and extended IDs on both controllers in
+            listen-only mode. Stream timestamped records over USB Serial/JTAG.
+            Vehicle controls, automations and BLE are not started.
+
     config DASHKIT_TESLA_BLE
         bool "Tesla BLE vehicle-command client"
         depends on BT_ENABLED && BT_NIMBLE_ENABLED

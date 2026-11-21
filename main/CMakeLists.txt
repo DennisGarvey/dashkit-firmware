@@ -4,7 +4,7 @@
 # on NimBLE's central API; tesla_ble_storage uses NVS; tesla_ble_client uses
 # the tesla-protocol session/protobuf layers.
 set(TESLA_SRCS "")
-if(CONFIG_DASHKIT_TESLA_BLE)
+if(CONFIG_DASHKIT_TESLA_BLE AND NOT CONFIG_DASHKIT_USB_CAPTURE)
     list(APPEND TESLA_SRCS
         "tesla/tesla_ble_adapter.c"
         "tesla/tesla_ble_storage.c"
@@ -15,8 +15,13 @@ endif()
 
 # BTHome listener (Shelly BLU), gated by DASHKIT_BTHOME (WIP, default off).
 set(BTHOME_SRCS "")
-if(CONFIG_DASHKIT_BTHOME)
+if(CONFIG_DASHKIT_BTHOME AND NOT CONFIG_DASHKIT_USB_CAPTURE)
     list(APPEND BTHOME_SRCS "bthome/bthome.c")
+endif()
+
+set(CAPTURE_SRCS "")
+if(CONFIG_DASHKIT_USB_CAPTURE)
+    list(APPEND CAPTURE_SRCS "capture/usb_capture.c")
 endif()
 
 idf_component_register(
@@ -39,12 +44,14 @@ idf_component_register(
         "ble/ble_server.c"
         "ble/ble_ota.c"
         "ble/ble_appchan.c"
+        ${CAPTURE_SRCS}
         ${TESLA_SRCS}
         ${BTHOME_SRCS}
     INCLUDE_DIRS
         "."
         "can"
         "can/dbc"
+        "capture"
         "controls"
         "automation"
         "ble"

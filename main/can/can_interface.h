@@ -10,6 +10,7 @@ typedef struct {
     uint32_t id;           // Arbitration ID (11-bit standard or 29-bit extended)
     uint8_t  data[CAN_MAX_DATA_LEN];
     uint8_t  dlc;          // Data Length Code
+    bool     rtr;          // true = remote transmission request
     bool     extended;     // true = 29-bit extended ID
     bool     fd;           // true = CAN FD frame
     bool     brs;          // true = bit rate switch (CAN FD)

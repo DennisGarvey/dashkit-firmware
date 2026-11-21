@@ -7,3 +7,14 @@ dependencies.lock
 .idea/
 .cache
 CLAUDE.md
+
+.idf-tools/
+build-capture/
+sdkconfig.capture.generated*
+build-tools-install.log
+build-capture.log
+build-env.log
+build-normal/
+build-normal.log
+sdkconfig.normal.generated*
+backups/

@@ -1,4 +1,7 @@
 #include "mcp251xfd.h"
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+#include "usb_capture.h"
+#endif
 #include "dbc/dbc_generated.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -108,11 +111,49 @@ typedef struct {
     volatile uint32_t   rx_overflow_events;
     uint32_t            rx_overflow_reported;  // last value the timer logged
     esp_timer_handle_t  overflow_timer;
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    uint32_t           rx_fifo_config;
+    _Alignas(4) uint8_t spi_tx[64];
+    _Alignas(4) uint8_t spi_rx[64];
+#endif
 } mcp251xfd_ctx_t;
 
 // ---------------------------------------------------------------------------
 // SPI low-level
 // ---------------------------------------------------------------------------
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+// Separate command and DMA-aligned data buffers avoid allocating/copying a DMA
+// bounce buffer for every small register transaction.
+static esp_err_t spi_write_reg(mcp251xfd_ctx_t *ctx, uint16_t addr, const uint8_t *data, size_t len)
+{
+    if (len > sizeof(ctx->spi_tx)) return ESP_ERR_INVALID_SIZE;
+    xSemaphoreTake(ctx->spi_mutex, portMAX_DELAY);
+    memcpy(ctx->spi_tx, data, len);
+    spi_transaction_t t = {
+        .cmd = SPI_CMD_WRITE(addr),
+        .length = len * 8,
+        .tx_buffer = ctx->spi_tx,
+    };
+    esp_err_t err = spi_device_polling_transmit(ctx->spi_dev, &t);
+    xSemaphoreGive(ctx->spi_mutex);
+    return err;
+}
+
+static esp_err_t spi_read_reg(mcp251xfd_ctx_t *ctx, uint16_t addr, uint8_t *data, size_t len)
+{
+    if (len > sizeof(ctx->spi_rx)) return ESP_ERR_INVALID_SIZE;
+    xSemaphoreTake(ctx->spi_mutex, portMAX_DELAY);
+    spi_transaction_t t = {
+        .cmd = SPI_CMD_READ(addr),
+        .length = len * 8,
+        .rx_buffer = ctx->spi_rx,
+    };
+    esp_err_t err = spi_device_polling_transmit(ctx->spi_dev, &t);
+    if (err == ESP_OK) memcpy(data, ctx->spi_rx, len);
+    xSemaphoreGive(ctx->spi_mutex);
+    return err;
+}
+#else
 static esp_err_t spi_write_reg(mcp251xfd_ctx_t *ctx, uint16_t addr, const uint8_t *data, size_t len)
 {
     uint16_t cmd = SPI_CMD_WRITE(addr);
@@ -161,6 +202,8 @@ static esp_err_t spi_read_reg(mcp251xfd_ctx_t *ctx, uint16_t addr, uint8_t *data
     return err;
 }
 
+#endif
+
 static esp_err_t write_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t val)
 {
     uint8_t d[4] = { val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF, (val >> 24) & 0xFF };
@@ -169,6 +212,7 @@ static esp_err_t write_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t val)
 
 static esp_err_t read_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t *val)
 {
+    *val = 0;
     uint8_t d[4];
     esp_err_t err = spi_read_reg(ctx, addr, d, 4);
     if (err == ESP_OK) {
@@ -179,12 +223,17 @@ static esp_err_t read_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t *val)
 
 static esp_err_t spi_reset(mcp251xfd_ctx_t *ctx)
 {
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    spi_transaction_t t = { .cmd = SPI_CMD_RESET };
+    return spi_device_polling_transmit(ctx->spi_dev, &t);
+#else
     uint8_t tx[2] = {0x00, 0x00};
     spi_transaction_t t = {
         .length = 16,
         .tx_buffer = tx,
     };
     return spi_device_transmit(ctx->spi_dev, &t);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -293,9 +342,18 @@ static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
     // 32 * 16 bytes = 512 B of the chip's 2 KB RAM. TX FIFO uses another 64 B.
     // Larger depth absorbs SPI/scheduling jitter (both CAN chips share SPI2,
     // and the rx_task only runs once per FreeRTOS tick).
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    // 24 * (8-byte header + 64-byte payload), alongside the 64-byte TX FIFO.
+    uint32_t rxfifo_con = (7u << FIFOCON_PLSIZE_SHIFT) |
+                          (23u << FIFOCON_FSIZE_SHIFT) | FIFOCON_TFNRFNIE;
+#else
     uint32_t rxfifo_con = (0 << FIFOCON_PLSIZE_SHIFT) |  // 8 bytes payload
                           (31 << FIFOCON_FSIZE_SHIFT) |   // 32 messages (value = n-1)
                           FIFOCON_TFNRFNIE;               // Not-empty interrupt
+#endif
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    ctx->rx_fifo_config = rxfifo_con;
+#endif
     esp_err_t err = write_reg32(ctx, REG_C1FIFOCON(1), rxfifo_con);
     if (err != ESP_OK) return err;
 
@@ -306,6 +364,17 @@ static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
     err = write_reg32(ctx, REG_C1FIFOCON(2), txfifo_con);
     if (err != ESP_OK) return err;
 
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    // MIDE=0 and a zero ID mask accept both standard and extended identifiers.
+    err = write_reg32(ctx, REG_C1FLTOBJ(0), 0);
+    if (err != ESP_OK) return err;
+    err = write_reg32(ctx, REG_C1MASK(0), 0);
+    if (err != ESP_OK) return err;
+    for (uint8_t w = 0; w < 8; w++) {
+        err = write_reg32(ctx, REG_C1FLTCON(w), w == 0 ? 0x81 : 0);
+        if (err != ESP_OK) return err;
+    }
+#else
     // ---- Hardware acceptance filtering ----
     const dbc_hw_filter_set_t *fs =
         (ctx->bus_id < DBC_HW_FILTER_BUS_COUNT) ? &g_dbc_hw_filters[ctx->bus_id]
@@ -325,6 +394,7 @@ static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
 
     ESP_LOGI(TAG, "Bus %u: %u HW RX filters programmed", (unsigned)ctx->bus_id,
              (unsigned)n);
+#endif
 
     return ESP_OK;
 }
@@ -344,15 +414,22 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 
 static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
 {
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    uint32_t ua;
+    if (read_reg32(ctx, REG_C1FIFOUA(1), &ua) != ESP_OK) return;
+#endif
     while (true) {
         // Check FIFO 1 status
         uint32_t fifosta;
-        read_reg32(ctx, REG_C1FIFOSTA(1), &fifosta);
+        if (read_reg32(ctx, REG_C1FIFOSTA(1), &fifosta) != ESP_OK) return;
 
         // Overflow is sticky: a frame was dropped because the FIFO filled up.
         // Count it and clear the flag (write 0 to RXOVIF, preserving the rest).
         if (fifosta & FIFOSTA_RXOVIF) {
             ctx->rx_overflow_events++;
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+            usb_capture_overflow(ctx->bus_id);
+#endif
             write_reg32(ctx, REG_C1FIFOSTA(1), fifosta & ~FIFOSTA_RXOVIF);
         }
 
@@ -361,12 +438,14 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
         }
 
         // Get user address (RAM offset of next message)
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
         uint32_t ua;
         read_reg32(ctx, REG_C1FIFOUA(1), &ua);
+#endif
 
         // Read message object from RAM (8 + 8 bytes for header + data)
         uint8_t msg[16];
-        spi_read_reg(ctx, RAM_BASE + ua, msg, 16);
+        if (spi_read_reg(ctx, RAM_BASE + ua, msg, 16) != ESP_OK) return;
 
         // Parse message object
         uint32_t r0 = msg[0] | (msg[1] << 8) | (msg[2] << 16) | (msg[3] << 24);
@@ -379,6 +458,7 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
         // SID is in bits [10:0]
         tagged.frame.id = r0 & 0x7FF;
         tagged.frame.extended = (r1 >> 4) & 1;
+        tagged.frame.rtr = (r1 >> 5) & 1;
         if (tagged.frame.extended) {
             uint32_t eid = (r0 >> 11) & 0x3FFFF;
             tagged.frame.id = (tagged.frame.id << 18) | eid;
@@ -392,17 +472,24 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
         if (data_len > 8) {
             // For CAN FD frames > 8 bytes, read remaining data
             uint8_t extra[64];
-            spi_read_reg(ctx, RAM_BASE + ua + 8, extra, data_len);
+            if (spi_read_reg(ctx, RAM_BASE + ua + 8, extra, data_len) != ESP_OK) return;
             memcpy(tagged.frame.data, extra, data_len);
         } else {
             memcpy(tagged.frame.data, &msg[8], data_len);
         }
 
         // Increment FIFO head pointer
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+        if (write_reg32(ctx, REG_C1FIFOCON(1), ctx->rx_fifo_config | FIFOCON_UINC) != ESP_OK) return;
+        // With TEF and TXQ disabled, FIFO 1 starts at RAM offset zero.
+        // Each of its 24 objects occupies an 8-byte header plus 64 data bytes.
+        ua = (ua + 72) % (24 * 72);
+#else
         uint32_t fifocon;
         read_reg32(ctx, REG_C1FIFOCON(1), &fifocon);
         fifocon |= FIFOCON_UINC;
         write_reg32(ctx, REG_C1FIFOCON(1), fifocon);
+#endif
 
         // Deliver frame via callback
         if (ctx->rx_cb) {
@@ -411,6 +498,7 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
     }
 }
 
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
 // Periodic RX FIFO overflow reporter.
 static void overflow_report_cb(void *arg)
 {
@@ -422,6 +510,8 @@ static void overflow_report_cb(void *arg)
              ctx->bus_id, (unsigned long)total, (unsigned long)delta,
              (long long)(RX_OVERFLOW_REPORT_US / 1000000));
 }
+
+#endif
 
 static void rx_task(void *arg)
 {
@@ -511,6 +601,7 @@ static esp_err_t iface_init(can_interface_t *self)
     return ESP_OK;
 }
 
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
 static esp_err_t loopback_self_test(mcp251xfd_ctx_t *ctx)
 {
     // Internal + external loopback self-test
@@ -628,12 +719,16 @@ static esp_err_t loopback_self_test(mcp251xfd_ctx_t *ctx)
     return ESP_OK;
 }
 
+#endif
+
 static esp_err_t iface_start(can_interface_t *self)
 {
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
 
     // Run loopback self-test first
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
     loopback_self_test(ctx);
+#endif
 
     ctx->running = true;
 
@@ -658,6 +753,7 @@ static esp_err_t iface_start(can_interface_t *self)
     // Independent periodic reporter for RX FIFO overflow drops. Runs in the
     // esp_timer task so it fires even when the rx_task is pinned draining a busy
     // FIFO (read_rx_fifo would otherwise starve any in-task reporting).
+#ifndef CONFIG_DASHKIT_USB_CAPTURE
     const esp_timer_create_args_t ov_args = {
         .callback = overflow_report_cb,
         .arg = ctx,
@@ -666,6 +762,7 @@ static esp_err_t iface_start(can_interface_t *self)
     if (esp_timer_create(&ov_args, &ctx->overflow_timer) == ESP_OK) {
         esp_timer_start_periodic(ctx->overflow_timer, RX_OVERFLOW_REPORT_US);
     }
+#endif
 
     // Re-enter config mode to reset FIFOs after loopback tests
     set_mode(ctx, OPMODE_CONFIG);
@@ -686,7 +783,11 @@ static esp_err_t iface_start(can_interface_t *self)
     // (ACKs incoming frames and sends queued TX frames). Required for the
     // BLE CAN TX characteristic to actually put frames on the bus.
     // For passive monitoring only, change to OPMODE_LISTEN_ONLY.
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    esp_err_t err = set_mode(ctx, OPMODE_LISTEN_ONLY);
+#else
     esp_err_t err = set_mode(ctx, OPMODE_NORMAL_2_0);
+#endif
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Bus %d: failed to enter normal mode", ctx->bus_id);
         return err;
@@ -711,6 +812,9 @@ static esp_err_t iface_stop(can_interface_t *self)
 
 static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
 {
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
 
     // Check TX FIFO 2 has space
@@ -819,6 +923,9 @@ can_interface_t *mcp251xfd_create(const mcp251xfd_config_t *config)
         .mode = 0,
         .spics_io_num = config->pin_cs,
         .queue_size = 1,
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+        .command_bits = 16,
+#endif
     };
 
     err = spi_bus_add_device(config->spi_host, &dev_cfg, &ctx->spi_dev);

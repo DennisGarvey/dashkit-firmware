@@ -119,6 +119,56 @@ idf.py flash monitor
 
 Press `Ctrl+]` to exit the serial monitor.
 
+### Passive USB streaming
+
+The `DASHKIT_USB_CAPTURE` build streams received CAN frames over USB. Both MCP2518FD
+controllers use a zero-mask acceptance filter for all standard and extended IDs,
+with no software whitelist. Controllers run in listen-only mode; loopback tests,
+vehicle controls, automations, BLE and NVS initialization are bypassed. The normal
+build retains its existing filtering and behavior.
+
+Both buses use 500 kbit/s nominal timing; CAN FD data timing defaults to 2 Mbit/s.
+The receive FIFOs hold 24 frames with room for up to 64 payload bytes each.
+Capturing a bus with different timing requires configuring matching timing first.
+
+Use the repository's pinned ESP-IDF and keep its tools in this directory:
+
+```sh
+export IDF_TOOLS_PATH="$PWD/.idf-tools"
+./esp-idf/install.sh esp32s3
+./tools/build_capture.sh
+```
+
+The script builds `build-capture/dashkit-firmware.bin`, using
+`sdkconfig.capture.generated` and the defaults in `sdkconfig.defaults` plus
+`sdkconfig.capture`. It does not flash a device. The capture configuration disables
+both console outputs so diagnostic text does not share the binary USB stream.
+
+USB Serial/JTAG streams COBS-delimited records with CRC16-CCITT, a boot identifier,
+per-bus sequence numbers, 64-bit software receive timestamps and CAN flags. The
+format is defined in `main/capture/capture_protocol.h`. A separate USB task drains
+a 1,024-frame queue without blocking the CAN receive tasks, batching records into
+full USB transfers. The capture profile uses the 240 MHz CPU setting, performance
+compiler optimization and DMA-aligned polling SPI transfers. Status records report
+queue drops, hardware FIFO overflow events and aborted USB writes. Overflow events
+are a lower bound on lost frames; sequence gaps and the other drop counters can
+overlap and must not be added together. Frames before the host connects cannot be
+recovered. Sustained capture throughput needs validation on the connected vehicle.
+SPI-level CRC checking and a separate SPI error counter are not implemented; a
+zero drop count does not independently verify every frame on the wire.
+
+Host protocol tests:
+
+```sh
+./tools/test/run_capture_protocol_test.sh
+```
+
+Before installing capture firmware, preserve a verified flash backup and inspect
+the installed partition layout, active OTA slot and flash security state. Preserve
+NVS and an existing recovery image when selecting the application slot to write.
+Do not use a full flash erase as part of capture installation. The standard build
+from this source is not a backup of the firmware currently installed on a device.
+
 ### Configuration
 
 Options under `idf.py menuconfig` → **DashKit**:
