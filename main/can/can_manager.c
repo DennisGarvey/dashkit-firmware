@@ -90,6 +90,9 @@ esp_err_t can_manager_start(void)
             return err;
         }
     }
+#ifdef CONFIG_DASHKIT_USB_TX
+    usb_capture_enable_tx();
+#endif
     return ESP_OK;
 }
 
@@ -112,7 +115,7 @@ esp_err_t can_manager_receive(can_tagged_frame_t *frame, uint32_t timeout_ms)
 
 esp_err_t can_manager_send(uint8_t bus_id, const can_frame_t *frame)
 {
-#ifdef CONFIG_DASHKIT_USB_CAPTURE
+#if defined(CONFIG_DASHKIT_USB_CAPTURE) && !defined(CONFIG_DASHKIT_USB_TX)
     return ESP_ERR_NOT_SUPPORTED;
 #endif
     if (!frame) return ESP_ERR_INVALID_ARG;

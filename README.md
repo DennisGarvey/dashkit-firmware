@@ -169,6 +169,26 @@ NVS and an existing recovery image when selecting the application slot to write.
 Do not use a full flash erase as part of capture installation. The standard build
 from this source is not a backup of the firmware currently installed on a device.
 
+### USB transmission
+
+Run `./tools/build_capture.sh --usb-tx` to build
+`build-usb-tx/dashkit-firmware.bin`. This profile runs both controllers in
+active CAN FD mode and starts acknowledging frames at startup. Use it on an
+isolated CAN network.
+
+In Cabana, open **Custom USB Serial**, then choose **Tools → Send Frame**.
+Select a DBC message to prefill its ID and payload length, or enter a custom ID
+and hex payload. **Send Once** submits one frame. A queued response
+confirms that the USB adapter queued the frame in the controller. Use a second node to
+observe delivery.
+
+To send a signal value, right-click the signal in the inspector and choose
+**Send Signal Value**. Pick a named value from the DBC value table when one is
+available, or enter a numeric value for other signals. Cabana starts from the
+newest captured frame containing the signal, looking back through up to 64
+frames of that message for the matching multiplexor value. The other bits,
+including any counters and checksums, are copied as-is.
+
 ### Configuration
 
 Options under `idf.py menuconfig` → **DashKit**:

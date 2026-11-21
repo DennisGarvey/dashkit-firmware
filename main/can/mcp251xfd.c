@@ -53,6 +53,7 @@ static const char *TAG = "mcp251xfd";
 #define C1CON_OPMOD_MASK    (0x7 << C1CON_OPMOD_SHIFT)
 #define C1CON_TXQEN         (1 << 20)
 #define C1CON_STEF          (1 << 19)
+#define C1CON_RTXAT         (1 << 16)
 #define C1CON_ISOCRCEN      (1 << 5)
 #define C1CON_PXEDIS        (1 << 6)
 
@@ -71,12 +72,14 @@ static const char *TAG = "mcp251xfd";
 #define FIFOCON_TXEN        (1 << 7)
 #define FIFOCON_UINC        (1 << 8)
 #define FIFOCON_TXREQ       (1 << 9)
+#define FIFOCON_FRESET      (1 << 10)
 #define FIFOCON_TFNRFNIE    (1 << 0)   // RX not empty / TX not full interrupt enable
 #define FIFOCON_FSIZE_SHIFT 24
 #define FIFOCON_PLSIZE_SHIFT 29
 
 // FIFO status bits
 #define FIFOSTA_TFNRFNIF    (1 << 0)   // Not empty (RX) / not full (TX)
+#define FIFOSTA_TXATIF      (1 << 4)   // TX attempt limit reached
 #define FIFOSTA_RXOVIF      (1 << 3)   // RX FIFO overflow: a frame was dropped
                                        // because the FIFO was full (sticky; the
                                        // app clears it by writing the bit to 0)
@@ -113,7 +116,11 @@ typedef struct {
     esp_timer_handle_t  overflow_timer;
 #ifdef CONFIG_DASHKIT_USB_CAPTURE
     uint32_t           rx_fifo_config;
+#ifdef CONFIG_DASHKIT_USB_TX
+    _Alignas(4) uint8_t spi_tx[72];
+#else
     _Alignas(4) uint8_t spi_tx[64];
+#endif
     _Alignas(4) uint8_t spi_rx[64];
 #endif
 } mcp251xfd_ctx_t;
@@ -361,6 +368,9 @@ static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
     uint32_t txfifo_con = (0 << FIFOCON_PLSIZE_SHIFT) |  // 8 bytes payload
                           (3 << FIFOCON_FSIZE_SHIFT)  |   // 4 messages
                           FIFOCON_TXEN;                    // TX mode
+#ifdef CONFIG_DASHKIT_USB_TX
+    txfifo_con = (7u << FIFOCON_PLSIZE_SHIFT) | FIFOCON_TXEN;
+#endif
     err = write_reg32(ctx, REG_C1FIFOCON(2), txfifo_con);
     if (err != ESP_OK) return err;
 
@@ -582,6 +592,9 @@ static esp_err_t iface_init(can_interface_t *self)
     uint32_t con;
     read_reg32(ctx, REG_C1CON, &con);
     con |= C1CON_ISOCRCEN;
+#ifdef CONFIG_DASHKIT_USB_TX
+    con |= C1CON_RTXAT;  // enforce the TX FIFO's single attempt setting.
+#endif
     con &= ~C1CON_PXEDIS;  // Allow protocol exception (graceful CAN FD handling)
     con &= ~C1CON_STEF;    // Disable TEF
     con &= ~C1CON_TXQEN;   // Disable TXQ, we use FIFO 2 for TX
@@ -770,7 +783,7 @@ static esp_err_t iface_start(can_interface_t *self)
     // Reset RX FIFO 1
     uint32_t fifocon_reset;
     read_reg32(ctx, REG_C1FIFOCON(1), &fifocon_reset);
-    fifocon_reset |= (1 << 10);  // FRESET bit
+    fifocon_reset |= FIFOCON_FRESET;
     write_reg32(ctx, REG_C1FIFOCON(1), fifocon_reset);
     vTaskDelay(pdMS_TO_TICKS(1));
 
@@ -783,7 +796,9 @@ static esp_err_t iface_start(can_interface_t *self)
     // (ACKs incoming frames and sends queued TX frames). Required for the
     // BLE CAN TX characteristic to actually put frames on the bus.
     // For passive monitoring only, change to OPMODE_LISTEN_ONLY.
-#ifdef CONFIG_DASHKIT_USB_CAPTURE
+#if defined(CONFIG_DASHKIT_USB_TX)
+    esp_err_t err = set_mode(ctx, OPMODE_NORMAL_FD);
+#elif defined(CONFIG_DASHKIT_USB_CAPTURE)
     esp_err_t err = set_mode(ctx, OPMODE_LISTEN_ONLY);
 #else
     esp_err_t err = set_mode(ctx, OPMODE_NORMAL_2_0);
@@ -812,21 +827,38 @@ static esp_err_t iface_stop(can_interface_t *self)
 
 static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
 {
-#ifdef CONFIG_DASHKIT_USB_CAPTURE
+#if defined(CONFIG_DASHKIT_USB_CAPTURE) && !defined(CONFIG_DASHKIT_USB_TX)
     return ESP_ERR_NOT_SUPPORTED;
 #endif
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
 
     // Check TX FIFO 2 has space
     uint32_t fifosta;
-    read_reg32(ctx, REG_C1FIFOSTA(2), &fifosta);
+    if (read_reg32(ctx, REG_C1FIFOSTA(2), &fifosta) != ESP_OK) return ESP_FAIL;
+#ifdef CONFIG_DASHKIT_USB_TX
+    if (fifosta & FIFOSTA_TXATIF) {
+        // The attempt limit was reached. Discard the failed frame without
+        // reasserting TXREQ, and let the host decide whether to send again.
+        uint32_t control;
+        if (read_reg32(ctx, REG_C1FIFOCON(2), &control) != ESP_OK) return ESP_FAIL;
+        control &= ~(FIFOCON_UINC | FIFOCON_TXREQ);
+        if (write_reg32(ctx, REG_C1FIFOCON(2), control | FIFOCON_FRESET) != ESP_OK) return ESP_FAIL;
+        if (read_reg32(ctx, REG_C1FIFOCON(2), &control) != ESP_OK ||
+            (control & (FIFOCON_FRESET | FIFOCON_TXREQ))) return ESP_FAIL;
+        if (read_reg32(ctx, REG_C1FIFOSTA(2), &fifosta) != ESP_OK ||
+            !(fifosta & FIFOSTA_TFNRFNIF)) return ESP_FAIL;
+        if ((fifosta & FIFOSTA_TXATIF) &&
+            write_reg32(ctx, REG_C1FIFOSTA(2), fifosta & ~FIFOSTA_TXATIF) != ESP_OK) return ESP_FAIL;
+        return ESP_ERR_TIMEOUT;
+    }
+#endif
     if (!(fifosta & FIFOSTA_TFNRFNIF)) {
         return ESP_ERR_NO_MEM;  // TX FIFO full
     }
 
     // Get user address for next TX slot
     uint32_t ua;
-    read_reg32(ctx, REG_C1FIFOUA(2), &ua);
+    if (read_reg32(ctx, REG_C1FIFOUA(2), &ua) != ESP_OK) return ESP_FAIL;
 
     // Build message object
     uint32_t t0 = frame->id & 0x7FF;
@@ -840,12 +872,17 @@ static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
     if (frame->brs)      t1 |= (1 << 6);
 
     uint8_t data_len = dlc_to_len(frame->dlc);
+#ifdef CONFIG_DASHKIT_USB_TX
+    if (frame->rtr) t1 |= (1 << 5);
+    uint8_t msg[72] = {0};
+#else
     if (data_len > 8) return ESP_ERR_NOT_SUPPORTED;
     // Always write full 16-byte message slot (8-byte header + 8-byte data
     // region) to the MCP2518FD TX FIFO RAM.  The ESP32 SPI peripheral with
     // DMA enabled silently drops trailing bytes when the transfer length is
     // not word-aligned.
     uint8_t msg[16] = {0};
+#endif
     msg[0] = t0 & 0xFF;
     msg[1] = (t0 >> 8) & 0xFF;
     msg[2] = (t0 >> 16) & 0xFF;
@@ -856,15 +893,13 @@ static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
     msg[7] = (t1 >> 24) & 0xFF;
     memcpy(&msg[8], frame->data, data_len);
 
-    spi_write_reg(ctx, RAM_BASE + ua, msg, 16);
+    if (spi_write_reg(ctx, RAM_BASE + ua, msg, sizeof(msg)) != ESP_OK) return ESP_FAIL;
 
     // Set UINC and TXREQ
     uint32_t fifocon;
-    read_reg32(ctx, REG_C1FIFOCON(2), &fifocon);
+    if (read_reg32(ctx, REG_C1FIFOCON(2), &fifocon) != ESP_OK) return ESP_FAIL;
     fifocon |= FIFOCON_UINC | FIFOCON_TXREQ;
-    write_reg32(ctx, REG_C1FIFOCON(2), fifocon);
-
-    return ESP_OK;
+    return write_reg32(ctx, REG_C1FIFOCON(2), fifocon);
 }
 
 static void iface_set_rx_callback(can_interface_t *self, can_rx_callback_t cb, void *user_ctx)

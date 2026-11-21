@@ -1,5 +1,9 @@
 #include "usb_capture.h"
 #include "capture_protocol.h"
+#ifdef CONFIG_DASHKIT_USB_TX
+#include "can_manager.h"
+#include <stdatomic.h>
+#endif
 
 #include "driver/usb_serial_jtag.h"
 #include "esp_random.h"
@@ -83,6 +87,72 @@ static void common_header(uint8_t *raw, uint8_t type, uint8_t bus,
     dk_put(raw + 12, timestamp_us, 8);
 }
 
+#ifdef CONFIG_DASHKIT_USB_TX
+static atomic_bool s_tx_ready;
+static const uint8_t lengths[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
+
+void usb_capture_enable_tx(void)
+{
+    atomic_store(&s_tx_ready, true);
+}
+
+static void write_tx_result(uint8_t bus, uint32_t sequence, uint8_t status)
+{
+    uint8_t raw[DK_MAX_RAW];
+    common_header(raw, DK_TX_RESULT, bus, sequence, esp_timer_get_time());
+    raw[20] = status;
+    write_record(raw, 21);
+}
+
+static void read_tx_requests(void)
+{
+    static uint8_t pending[DK_MAX_WIRE];
+    static size_t count;
+    static bool discarding;
+    static int64_t next_send;
+    uint8_t bytes[256];
+    int n = usb_serial_jtag_read_bytes(bytes, sizeof(bytes), 0);
+    for (int i = 0; i < n; ++i) {
+        if (bytes[i]) {
+            if (count == sizeof(pending)) discarding = true;
+            if (!discarding) pending[count++] = bytes[i];
+            continue;
+        }
+        uint8_t raw[DK_MAX_RAW];
+        size_t size = discarding ? 0 : dk_decode(pending, count, raw);
+        count = 0;
+        discarding = false;
+        if (!size || raw[1] != DK_TX_REQUEST || dk_get(raw + 4, 4) != s_boot_id) continue;
+
+        uint32_t sequence = dk_get(raw + 8, 4);
+        uint8_t bus = raw[2];
+        int64_t now = esp_timer_get_time();
+        if (!sequence || !atomic_load(&s_tx_ready)) continue;
+        if (now < next_send) {
+            write_tx_result(bus, sequence, DK_TX_RATE_LIMIT);
+            continue;
+        }
+        next_send = now + 100000;
+        can_frame_t frame = {
+            .id = dk_get(raw + 20, 4),
+            .extended = (raw[3] & 1) != 0,
+            .rtr = (raw[3] & 2) != 0,
+            .fd = (raw[3] & 4) != 0,
+            .brs = (raw[3] & 8) != 0,
+        };
+        while (lengths[frame.dlc] != raw[24]) ++frame.dlc;
+        if (!frame.rtr) memcpy(frame.data, raw + 25, raw[24]);
+        esp_err_t result = can_manager_send(bus, &frame);
+        uint8_t status = DK_TX_REJECTED;
+        if (result == ESP_OK) status = DK_TX_QUEUED;
+        else if (result == ESP_ERR_NO_MEM) status = DK_TX_FIFO_FULL;
+        else if (result == ESP_ERR_TIMEOUT) status = DK_TX_PREVIOUS_FAILED;
+        else if (result == ESP_FAIL) status = DK_TX_CONTROLLER_ERROR;
+        write_tx_result(bus, sequence, status);
+    }
+}
+#endif
+
 static void capture_task(void *arg)
 {
     (void)arg;
@@ -90,6 +160,9 @@ static void capture_task(void *arg)
     int64_t next_flush = 0;
     capture_item_t item;
     while (true) {
+#ifdef CONFIG_DASHKIT_USB_TX
+        read_tx_requests();
+#endif
         if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(2)) == pdTRUE) {
             uint8_t raw[DK_MAX_RAW];
             const can_frame_t *f = &item.frame.frame;
@@ -113,6 +186,9 @@ static void capture_task(void *arg)
                 dk_put(raw + 28, s_usb_aborts, 4);
                 write_record(raw, 32);
             }
+#ifdef CONFIG_DASHKIT_USB_TX
+            if (atomic_load(&s_tx_ready)) write_tx_result(0, 0, DK_TX_READY);
+#endif
             next_status = now + 1000000;
         }
         if (now >= next_flush) {
