@@ -25,13 +25,14 @@ typedef struct {
 static QueueHandle_t s_queue;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_boot_id;
-static uint32_t s_sequence[2], s_queue_drops[2], s_overflows[2], s_usb_aborts;
+static uint32_t s_sequence[2], s_queue_drops[2], s_overflows[2];
+static atomic_uint s_usb_aborts;
 static const uint8_t s_lengths[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
 
 // SPI2 is shared by both MCP2518FD controllers. Count clocked bits, which
 // excludes mutex waits and the time spent setting up transactions.
 static atomic_uint s_spi_bits[2];
-static uint32_t s_serial_bytes;
+static atomic_uint s_serial_bytes;
 static uint32_t s_can_nominal_bits[2], s_can_data_bits[2];
 
 void usb_capture_account_spi(uint8_t bus_id, uint32_t clock_bits)
@@ -60,6 +61,53 @@ static void account_can_frame(uint8_t bus, const can_frame_t *frame)
     s_can_data_bits[bus] += data;
 }
 
+#ifdef CONFIG_DASHKIT_USB_TX
+static TaskHandle_t s_capture_task;
+static QueueHandle_t s_usb_output_queue;
+
+void usb_capture_notify_tx_event(void)
+{
+    if (s_capture_task) xTaskNotifyGive(s_capture_task);
+}
+
+static portMUX_TYPE s_repeat_lock = portMUX_INITIALIZER_UNLOCKED;
+static struct {
+    can_frame_t frame;
+    uint8_t mask[64], selector[64];
+    uint32_t sequence;
+    uint8_t bus, finish_status;
+    bool automatic, pending, retry_pending, automatic_needs_send;
+    int64_t interval, next_repeat, end, lease;
+} s_repeat;
+
+// Refresh the payload at CAN ingress even if USB capture is backlogged.
+static void observe_repeat(const can_tagged_frame_t *received)
+{
+    const can_frame_t *actual = &received->frame;
+    can_frame_t *wanted = &s_repeat.frame;
+    bool wake = false;
+    portENTER_CRITICAL(&s_repeat_lock);
+    if (s_repeat.sequence && received->bus_id == s_repeat.bus &&
+        actual->id == wanted->id && actual->extended == wanted->extended &&
+        !actual->rtr && actual->fd == wanted->fd && actual->brs == wanted->brs) {
+        uint8_t actual_length = actual->fd ? s_lengths[actual->dlc & 15] : (actual->dlc > 8 ? 8 : actual->dlc);
+        uint8_t wanted_length = s_lengths[wanted->dlc];
+        if (actual_length == wanted_length &&
+            dk_matches_mask(wanted->data, actual->data, s_repeat.selector, wanted_length)) {
+            const bool changed = dk_merge_masked(wanted->data, actual->data, s_repeat.mask, wanted_length);
+            if (s_repeat.automatic) {
+                wake = changed && !s_repeat.pending;
+                s_repeat.pending = changed;
+                s_repeat.automatic_needs_send = changed;
+                if (!changed) s_repeat.retry_pending = false;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_repeat_lock);
+    if (wake) usb_capture_notify_tx_event();
+}
+#endif
+
 void usb_capture_overflow(uint8_t bus_id)
 {
     if (bus_id > 1) return;
@@ -71,6 +119,9 @@ void usb_capture_overflow(uint8_t bus_id)
 void usb_capture_submit(const can_tagged_frame_t *frame)
 {
     if (!s_queue || frame->bus_id > 1) return;
+#ifdef CONFIG_DASHKIT_USB_TX
+    observe_repeat(frame);
+#endif
     capture_item_t item = { .frame = *frame };
     portENTER_CRITICAL(&s_lock);
     account_can_frame(frame->bus_id, &frame->frame);
@@ -86,30 +137,58 @@ void usb_capture_submit(const can_tagged_frame_t *frame)
 
 // Keep the USB endpoint supplied with full packets rather than submitting one
 // short USB transfer for each CAN frame.
-static uint8_t s_output[2048];
-static size_t s_output_size;
+typedef struct {
+    size_t size;
+    uint8_t bytes[2048];
+} usb_output_t;
+
+static usb_output_t s_output;
+
+static void send_usb_output(const usb_output_t *output)
+{
+    size_t sent = 0;
+    while (sent < output->size) {
+        int n = usb_serial_jtag_write_bytes(output->bytes + sent, output->size - sent, pdMS_TO_TICKS(10));
+        if (n <= 0) {
+            atomic_fetch_add_explicit(&s_usb_aborts, 1, memory_order_relaxed);
+            break;
+        }
+        atomic_fetch_add_explicit(&s_serial_bytes, (unsigned)n, memory_order_relaxed);
+        sent += (size_t)n;
+    }
+}
+
+#ifdef CONFIG_DASHKIT_USB_TX
+static void usb_output_task(void *arg)
+{
+    (void)arg;
+    usb_output_t output;
+    while (true) {
+        if (xQueueReceive(s_usb_output_queue, &output, portMAX_DELAY) == pdTRUE) {
+            send_usb_output(&output);
+        }
+    }
+}
+#endif
 
 static void flush_records(void)
 {
-    if (!s_output_size) return;
-    size_t sent = 0;
-    while (sent < s_output_size) {
-        int n = usb_serial_jtag_write_bytes(s_output + sent, s_output_size - sent, pdMS_TO_TICKS(10));
-        if (n <= 0) {
-            s_usb_aborts++;
-            break;
-        }
-        s_serial_bytes += (uint32_t)n;
-        sent += (size_t)n;
-    }
-    s_output_size = 0;
+    if (!s_output.size) return;
+#ifdef CONFIG_DASHKIT_USB_TX
+    // Never let a blocked USB reader hold up CAN scheduling or ACK handling.
+    if (xQueueSend(s_usb_output_queue, &s_output, 0) != pdTRUE)
+        atomic_fetch_add_explicit(&s_usb_aborts, 1, memory_order_relaxed);
+#else
+    send_usb_output(&s_output);
+#endif
+    s_output.size = 0;
 }
 
 static void write_record(uint8_t *raw, size_t size)
 {
-    if (sizeof(s_output) - s_output_size < DK_MAX_WIRE + 1) flush_records();
-    s_output[s_output_size++] = 0;
-    s_output_size += dk_encode(raw, size, s_output + s_output_size);
+    if (sizeof(s_output.bytes) - s_output.size < DK_MAX_WIRE + 1) flush_records();
+    s_output.bytes[s_output.size++] = 0;
+    s_output.size += dk_encode(raw, size, s_output.bytes + s_output.size);
 }
 
 static void common_header(uint8_t *raw, uint8_t type, uint8_t bus,
@@ -132,15 +211,13 @@ void usb_capture_enable_tx(void)
     atomic_store(&s_tx_ready, true);
 }
 
-static int64_t s_next_send;
+static int64_t s_next_manual_send;
 static struct {
     can_frame_t frame;
-    uint8_t mask[64];
+    int64_t deadline;
     uint32_t sequence;
     uint8_t bus;
-    bool automatic, pending;
-    int64_t interval, next_repeat, end, lease;
-} s_repeat;
+} s_pending_tx;
 
 static void write_tx_result(uint8_t type, uint8_t bus, uint32_t sequence, uint8_t status)
 {
@@ -150,21 +227,81 @@ static void write_tx_result(uint8_t type, uint8_t bus, uint32_t sequence, uint8_
     write_record(raw, 21);
 }
 
-static uint8_t send_frame(uint8_t bus, const can_frame_t *frame, int64_t now)
+static uint8_t send_frame(uint8_t bus, const can_frame_t *frame, uint32_t sequence)
 {
-    if (now < s_next_send) return DK_TX_RATE_LIMIT;
-    s_next_send = now + 100000;
+    if (s_pending_tx.deadline) return DK_TX_FIFO_FULL;
     esp_err_t result = can_manager_send(bus, frame);
     if (result == ESP_OK) {
-        portENTER_CRITICAL(&s_lock);
-        account_can_frame(bus, frame);
-        portEXIT_CRITICAL(&s_lock);
+        s_pending_tx.frame = *frame;
+        s_pending_tx.bus = bus;
+        s_pending_tx.sequence = sequence;
+        s_pending_tx.deadline = esp_timer_get_time() + 100000;
         return DK_TX_QUEUED;
     }
     if (result == ESP_ERR_NO_MEM) return DK_TX_FIFO_FULL;
-    if (result == ESP_ERR_TIMEOUT) return DK_TX_PREVIOUS_FAILED;
     if (result == ESP_FAIL) return DK_TX_CONTROLLER_ERROR;
     return DK_TX_REJECTED;
+}
+
+static void update_repeat_stop(int64_t now)
+{
+    if (!s_repeat.sequence || s_repeat.finish_status) return;
+    if (now >= s_repeat.end) {
+        s_repeat.finish_status = DK_TX_REPEAT_FINISHED;
+    } else if (now >= s_repeat.lease || !usb_serial_jtag_is_connected()) {
+        s_repeat.finish_status = DK_TX_REPEAT_LEASE_EXPIRED;
+    }
+}
+
+static void service_tx_feedback(void)
+{
+    if (!s_pending_tx.deadline) return;
+    const bool stopping = s_pending_tx.sequence && s_pending_tx.sequence == s_repeat.sequence && s_repeat.finish_status;
+    const bool expired = esp_timer_get_time() >= s_pending_tx.deadline;
+    const uint8_t bus = s_pending_tx.bus;
+    can_tx_diagnostics_t diagnostics = {0};
+    const esp_err_t result = can_manager_poll_tx(bus, expired || stopping, &diagnostics);
+    const bool completed = result == ESP_OK || result == ESP_ERR_TIMEOUT ||
+                           result == ESP_ERR_INVALID_RESPONSE;
+    if (!completed && !expired) return;
+
+    const uint32_t sequence = s_pending_tx.sequence;
+    s_pending_tx.sequence = 0;
+    // A failed SPI operation leaves the controller slot unavailable until
+    // polling can confirm completion or clear it.
+    if (completed) s_pending_tx.deadline = 0;
+    if (result == ESP_OK) {
+        portENTER_CRITICAL(&s_lock);
+        account_can_frame(bus, &s_pending_tx.frame);
+        portEXIT_CRITICAL(&s_lock);
+    }
+    if (!sequence) return;
+    const bool timed = sequence == s_repeat.sequence;
+    if (timed && result == ESP_ERR_TIMEOUT && diagnostics.arbitration_only) {
+        if (!stopping) {
+            portENTER_CRITICAL(&s_repeat_lock);
+            s_repeat.retry_pending = !s_repeat.automatic || s_repeat.automatic_needs_send;
+            portEXIT_CRITICAL(&s_repeat_lock);
+        }
+        return;
+    }
+    // A deliberate abort may clear a pending frame without an outcome.
+    if (stopping && result == ESP_ERR_INVALID_RESPONSE) return;
+    const uint8_t feedback = result == ESP_OK ? DK_TX_ACKNOWLEDGED :
+                             result == ESP_ERR_TIMEOUT ? DK_TX_UNCONFIRMED : DK_TX_OUTCOME_UNKNOWN;
+    if (feedback != DK_TX_ACKNOWLEDGED && diagnostics.valid) {
+        uint8_t raw[DK_MAX_RAW];
+        common_header(raw, DK_TX_FEEDBACK, bus, sequence, esp_timer_get_time());
+        raw[20] = feedback;
+        dk_put(raw + 21, diagnostics.fifo_status, 4);
+        dk_put(raw + 25, diagnostics.bus_diagnostics, 4);
+        dk_put(raw + 29, diagnostics.error_counters, 4);
+        write_record(raw, DK_TX_FEEDBACK_DIAGNOSTICS_SIZE);
+    } else {
+        write_tx_result(DK_TX_FEEDBACK, bus, sequence, feedback);
+    }
+    if (sequence == s_repeat.sequence && feedback != DK_TX_ACKNOWLEDGED && !s_repeat.finish_status)
+        s_repeat.finish_status = feedback == DK_TX_UNCONFIRMED ? DK_TX_PREVIOUS_FAILED : DK_TX_CONTROLLER_ERROR;
 }
 
 static void finish_repeat(uint8_t status)
@@ -172,48 +309,42 @@ static void finish_repeat(uint8_t status)
     bool automatic = s_repeat.automatic;
     uint8_t bus = s_repeat.bus;
     uint32_t sequence = s_repeat.sequence;
+    portENTER_CRITICAL(&s_repeat_lock);
     s_repeat.sequence = 0;
     s_repeat.pending = false;
+    portEXIT_CRITICAL(&s_repeat_lock);
     if (sequence)
         write_tx_result(automatic ? DK_TX_AUTO_RESULT : DK_TX_REPEAT_RESULT,
                         bus, sequence, status);
-}
-
-static void observe_repeat(const can_tagged_frame_t *received)
-{
-    if (s_repeat.sequence && received->bus_id == s_repeat.bus) {
-        can_frame_t *wanted = &s_repeat.frame;
-        const can_frame_t *actual = &received->frame;
-        if (actual->id == wanted->id && actual->extended == wanted->extended) {
-            uint8_t wanted_length = wanted->fd ? s_lengths[wanted->dlc & 15] : (wanted->dlc > 8 ? 8 : wanted->dlc);
-            uint8_t actual_length = actual->fd ? s_lengths[actual->dlc & 15] : (actual->dlc > 8 ? 8 : actual->dlc);
-            bool compatible = actual->rtr == wanted->rtr && actual->fd == wanted->fd &&
-                actual->brs == wanted->brs && actual_length == wanted_length;
-            bool changed = !compatible;
-            if (compatible && !wanted->rtr)
-                changed = dk_merge_masked(wanted->data, actual->data, s_repeat.mask, wanted_length);
-            if (s_repeat.automatic && changed) s_repeat.pending = true;
-        }
-    }
 }
 
 static void service_repeat(void)
 {
     int64_t now = esp_timer_get_time();
     if (!s_repeat.sequence) return;
-    if (now >= s_repeat.end) {
-        finish_repeat(DK_TX_REPEAT_FINISHED);
-    } else if (now >= s_repeat.lease || !usb_serial_jtag_is_connected()) {
-        finish_repeat(DK_TX_REPEAT_LEASE_EXPIRED);
-    } else if ((s_repeat.automatic && s_repeat.pending) ||
-               (!s_repeat.automatic && now >= s_repeat.next_repeat)) {
-        uint8_t result = send_frame(s_repeat.bus, &s_repeat.frame, now);
-        if (result == DK_TX_QUEUED) {
-            s_repeat.pending = false;
-            if (!s_repeat.automatic) s_repeat.next_repeat = now + s_repeat.interval;
-        } else if (result != DK_TX_RATE_LIMIT) {
-            finish_repeat(result);
-        }
+    update_repeat_stop(now);
+    if (s_repeat.finish_status) {
+        if (!s_pending_tx.sequence) finish_repeat(s_repeat.finish_status);
+        return;
+    }
+    if (s_pending_tx.deadline) return;
+    can_frame_t frame;
+    portENTER_CRITICAL(&s_repeat_lock);
+    const bool due = s_repeat.retry_pending ||
+                     (s_repeat.automatic ? s_repeat.pending : now >= s_repeat.next_repeat);
+    if (due) {
+        frame = s_repeat.frame;
+        s_repeat.pending = false;
+        s_repeat.retry_pending = false;
+    }
+    portEXIT_CRITICAL(&s_repeat_lock);
+    if (!due) return;
+
+    uint8_t result = send_frame(s_repeat.bus, &frame, s_repeat.sequence);
+    if (result == DK_TX_QUEUED) {
+        if (!s_repeat.automatic) s_repeat.next_repeat = now + s_repeat.interval;
+    } else {
+        finish_repeat(result);
     }
 }
 
@@ -224,7 +355,7 @@ static void read_tx_requests(void)
     static bool discarding;
     uint8_t bytes[256];
     int n = usb_serial_jtag_read_bytes(bytes, sizeof(bytes), 0);
-    if (n > 0) s_serial_bytes += (uint32_t)n;
+    if (n > 0) atomic_fetch_add_explicit(&s_serial_bytes, (unsigned)n, memory_order_relaxed);
     for (int i = 0; i < n; ++i) {
         if (bytes[i]) {
             if (count == sizeof(pending)) discarding = true;
@@ -244,7 +375,7 @@ static void read_tx_requests(void)
             bool matches = sequence == s_repeat.sequence && bus == s_repeat.bus;
             bool cancel = matches && raw[20] == DK_TX_CANCEL;
             if (matches && !cancel && now < s_repeat.lease) s_repeat.lease = now + 1000000;
-            if (cancel) finish_repeat(DK_TX_REPEAT_CANCELLED);
+            if (cancel && !s_repeat.finish_status) s_repeat.finish_status = DK_TX_REPEAT_CANCELLED;
             continue;
         }
         bool repeat = raw[1] == DK_TX_REPEAT;
@@ -258,7 +389,11 @@ static void read_tx_requests(void)
                             repeat || automatic ? DK_TX_REPEAT_BUSY : DK_TX_RATE_LIMIT);
             continue;
         }
-        if (!repeat && !automatic && now < s_next_send) {
+        if (s_pending_tx.deadline) {
+            write_tx_result(result_type, bus, sequence, DK_TX_FIFO_FULL);
+            continue;
+        }
+        if (!repeat && !automatic && now < s_next_manual_send) {
             write_tx_result(result_type, bus, sequence, DK_TX_RATE_LIMIT);
             continue;
         }
@@ -272,19 +407,33 @@ static void read_tx_requests(void)
         while (s_lengths[frame.dlc] != raw[24]) ++frame.dlc;
         if (!frame.rtr) memcpy(frame.data, raw + 25, raw[24]);
         if (repeat || automatic) {
+            if (frame.rtr) {
+                write_tx_result(result_type, bus, sequence, DK_TX_REJECTED);
+                continue;
+            }
+            const bool has_selector = size == (size_t)(27 + 3 * raw[24]);
+            portENTER_CRITICAL(&s_repeat_lock);
             s_repeat.frame = frame;
             memcpy(s_repeat.mask, raw + 25 + raw[24], raw[24]);
+            memset(s_repeat.selector, 0, raw[24]);
+            if (has_selector) memcpy(s_repeat.selector, raw + 25 + 2 * raw[24], raw[24]);
             s_repeat.bus = bus;
             s_repeat.sequence = sequence;
             s_repeat.automatic = automatic;
             s_repeat.pending = true;
-            s_repeat.interval = automatic ? 0 : 1000000 / dk_get(raw + 12, 4);
+            s_repeat.retry_pending = false;
+            s_repeat.automatic_needs_send = true;
+            portEXIT_CRITICAL(&s_repeat_lock);
+            s_repeat.finish_status = 0;
+            uint32_t hz = dk_get(raw + 12, 4);
+            s_repeat.interval = automatic ? 0 : (1000000 + hz - 1) / hz;
             s_repeat.next_repeat = now;
             s_repeat.end = now + 1000 * dk_get(raw + 16, 4);
             s_repeat.lease = now + 1000000;
             write_tx_result(result_type, bus, sequence, DK_TX_REPEAT_STARTED);
         } else {
-            uint8_t status = send_frame(bus, &frame, now);
+            s_next_manual_send = now + 100000;
+            uint8_t status = send_frame(bus, &frame, sequence);
             write_tx_result(result_type, bus, sequence, status);
         }
     }
@@ -326,8 +475,7 @@ static void write_utilization(int64_t now)
     portEXIT_CRITICAL(&s_lock);
     const uint32_t spi0 = atomic_exchange_explicit(&s_spi_bits[0], 0, memory_order_relaxed);
     const uint32_t spi1 = atomic_exchange_explicit(&s_spi_bits[1], 0, memory_order_relaxed);
-    const uint32_t serial = s_serial_bytes;
-    s_serial_bytes = 0;
+    const uint32_t serial = atomic_exchange_explicit(&s_serial_bytes, 0, memory_order_relaxed);
 
     if (previous_time) {
         uint64_t elapsed = now - previous_time;
@@ -360,14 +508,22 @@ static void capture_task(void *arg)
     while (true) {
 #ifdef CONFIG_DASHKIT_USB_TX
         read_tx_requests();
+        update_repeat_stop(esp_timer_get_time());
+        service_tx_feedback();
         service_repeat();
-#endif
+        const bool timed = s_pending_tx.deadline || s_repeat.sequence;
+        if (xQueueReceive(s_queue, &item, timed ? 0 : pdMS_TO_TICKS(2)) == pdTRUE) {
+            write_capture_item(&item);
+        } else if (timed) {
+            // RX and TX events can wake this immediately. A tick timeout
+            // still services deadlines and covers missed GPIO edges.
+            ulTaskNotifyTake(pdTRUE, 1);
+        }
+#else
         if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(2)) == pdTRUE) {
-#ifdef CONFIG_DASHKIT_USB_TX
-            observe_repeat(&item.frame);
-#endif
             write_capture_item(&item);
         }
+#endif
         int64_t now = esp_timer_get_time();
         if (now >= next_status) {
             write_utilization(now);
@@ -378,14 +534,15 @@ static void capture_task(void *arg)
                 dk_put(raw + 20, s_queue_drops[bus], 4);
                 dk_put(raw + 24, s_overflows[bus], 4);
                 portEXIT_CRITICAL(&s_lock);
-                dk_put(raw + 28, s_usb_aborts, 4);
+                dk_put(raw + 28, atomic_load_explicit(&s_usb_aborts, memory_order_relaxed), 4);
                 write_record(raw, DK_STATUS_SIZE);
             }
 #ifdef CONFIG_DASHKIT_USB_TX
-            if (atomic_load(&s_tx_ready))
+            if (atomic_load(&s_tx_ready)) {
+                write_tx_result(DK_TX_FEEDBACK, 0, 0, DK_TX_READY);
                 write_tx_result(DK_TX_RESULT, DK_TX_REPEAT_CAPABILITY, 0, DK_TX_READY);
-            if (atomic_load(&s_tx_ready))
                 write_tx_result(DK_TX_AUTO_RESULT, 0, 0, DK_TX_READY);
+            }
 #endif
             next_status = now + 1000000;
         }
@@ -407,7 +564,16 @@ esp_err_t usb_capture_init(void)
     s_queue = xQueueCreate(CAPTURE_QUEUE_DEPTH, sizeof(capture_item_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
     s_boot_id = esp_random();
-    if (xTaskCreatePinnedToCore(capture_task, "can2usb", 4096, NULL, 5, NULL, 0) != pdPASS)
+#ifdef CONFIG_DASHKIT_USB_TX
+    s_usb_output_queue = xQueueCreate(4, sizeof(usb_output_t));
+    if (!s_usb_output_queue) return ESP_ERR_NO_MEM;
+    if (xTaskCreatePinnedToCore(usb_output_task, "usb_output", 4096, NULL, 6, NULL, 0) != pdPASS)
+        return ESP_ERR_NO_MEM;
+    TaskHandle_t *capture_handle = &s_capture_task;
+#else
+    TaskHandle_t *capture_handle = NULL;
+#endif
+    if (xTaskCreatePinnedToCore(capture_task, "can2usb", 4096, NULL, 5, capture_handle, 0) != pdPASS)
         return ESP_ERR_NO_MEM;
     return ESP_OK;
 }

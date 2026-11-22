@@ -26,12 +26,25 @@ typedef struct {
 // Callback for received frames
 typedef void (*can_rx_callback_t)(const can_tagged_frame_t *frame, void *user_ctx);
 
+#ifdef CONFIG_DASHKIT_USB_TX
+typedef struct {
+    uint32_t fifo_status;
+    uint32_t bus_diagnostics;
+    uint32_t error_counters;
+    bool valid;
+    bool arbitration_only;
+} can_tx_diagnostics_t;
+#endif
+
 // Abstract CAN interface - all CAN controllers implement this
 typedef struct can_interface {
     esp_err_t (*init)(struct can_interface *self);
     esp_err_t (*start)(struct can_interface *self);
     esp_err_t (*stop)(struct can_interface *self);
     esp_err_t (*send)(struct can_interface *self, const can_frame_t *frame);
+#ifdef CONFIG_DASHKIT_USB_TX
+    esp_err_t (*poll_tx)(struct can_interface *self, bool abort, can_tx_diagnostics_t *diagnostics);
+#endif
     void (*set_rx_callback)(struct can_interface *self, can_rx_callback_t cb, void *user_ctx);
 
     uint8_t bus_id;        // Bus index (1-based, matching DashPilot convention)

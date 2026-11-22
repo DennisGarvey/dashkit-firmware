@@ -129,6 +129,17 @@ esp_err_t can_manager_send(uint8_t bus_id, const can_frame_t *frame)
     return ESP_ERR_NOT_FOUND;
 }
 
+#ifdef CONFIG_DASHKIT_USB_TX
+esp_err_t can_manager_poll_tx(uint8_t bus_id, bool abort, can_tx_diagnostics_t *diagnostics)
+{
+    for (int i = 0; i < s_iface_count; i++) {
+        can_interface_t *iface = s_interfaces[i];
+        if (iface->bus_id == bus_id && iface->poll_tx) return iface->poll_tx(iface, abort, diagnostics);
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+#endif
+
 esp_err_t can_manager_inject(const can_tagged_frame_t *frame)
 {
     if (!s_rx_queue) return ESP_ERR_INVALID_STATE;
