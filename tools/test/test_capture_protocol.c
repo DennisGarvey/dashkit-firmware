@@ -40,6 +40,12 @@ int main(void)
     assert(dk_decode(wire, 35, decoded) == 34);
     assert(dk_decode(wire, 34, decoded) == 0);
     assert(dk_decode(wire, 0, decoded) == 0);
+    raw[1] = DK_UTILIZATION;
+    dk_put(raw + 20, 123, 2);
+    dk_put(raw + 30, 1000, 2);
+    assert(dk_decode(wire, dk_encode(raw, DK_UTILIZATION_SIZE, wire) - 1, decoded) == DK_UTILIZATION_SIZE + 2);
+    dk_put(raw + 30, 1001, 2);
+    assert(dk_decode(wire, dk_encode(raw, DK_UTILIZATION_SIZE, wire) - 1, decoded) == 0);
     memset(raw, 0, sizeof(raw));
     raw[0] = DK_VERSION;
     raw[1] = DK_TX_REPEAT;

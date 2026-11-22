@@ -10,6 +10,7 @@
 menu "DashKit"
     config DASHKIT_USB_CAPTURE
         bool "Passive USB CAN capture"
+        select FREERTOS_GENERATE_RUN_TIME_STATS
         default n
         help
             Accept all standard and extended IDs on both controllers in

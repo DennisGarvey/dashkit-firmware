@@ -143,6 +143,7 @@ static esp_err_t spi_write_reg(mcp251xfd_ctx_t *ctx, uint16_t addr, const uint8_
     };
     esp_err_t err = spi_device_polling_transmit(ctx->spi_dev, &t);
     xSemaphoreGive(ctx->spi_mutex);
+    if (err == ESP_OK) usb_capture_account_spi(ctx->bus_id, (len + 2) * 8);
     return err;
 }
 
@@ -158,6 +159,7 @@ static esp_err_t spi_read_reg(mcp251xfd_ctx_t *ctx, uint16_t addr, uint8_t *data
     esp_err_t err = spi_device_polling_transmit(ctx->spi_dev, &t);
     if (err == ESP_OK) memcpy(data, ctx->spi_rx, len);
     xSemaphoreGive(ctx->spi_mutex);
+    if (err == ESP_OK) usb_capture_account_spi(ctx->bus_id, (len + 2) * 8);
     return err;
 }
 #else

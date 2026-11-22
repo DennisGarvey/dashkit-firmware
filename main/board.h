@@ -20,6 +20,9 @@
 #define CAN1_SPI_CLOCK_HZ   (10 * 1000 * 1000)
 #define CAN1_OSC_FREQ_HZ    (40 * 1000 * 1000)
 
+#define CAN_NOMINAL_BITRATE 500000u
+#define CAN_FD_DATA_BITRATE (CAN_NOMINAL_BITRATE * 4u)
+
 // --- RGB LED (active low) ---
 #define LED_PIN_R           GPIO_NUM_39
 #define LED_PIN_G           GPIO_NUM_40
