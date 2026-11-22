@@ -112,5 +112,15 @@ int main(void)
     raw[20] = DK_TX_READY;
     dk_put(raw + 8, 0, 4);
     assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 23);
+    memset(raw, 0, sizeof(raw));
+    raw[0] = DK_VERSION;
+    raw[1] = DK_TX_FRAME;
+    raw[2] = 1;
+    raw[24] = 1;
+    raw[25] = 42;
+    assert(dk_decode(wire, dk_encode(raw, 26, wire) - 1, decoded) == 0);
+    dk_put(raw + 8, 2, 4);
+    assert(dk_decode(wire, dk_encode(raw, 26, wire) - 1, decoded) == 28);
+    assert(decoded[25] == 42);
     puts("Capture protocol: frame roundtrips, corruption, masked timed modes, status, and truncation passed");
 }

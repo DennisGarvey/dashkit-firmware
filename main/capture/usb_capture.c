@@ -203,6 +203,19 @@ static void common_header(uint8_t *raw, uint8_t type, uint8_t bus,
     dk_put(raw + 12, timestamp_us, 8);
 }
 
+static void write_can_frame(uint8_t type, uint8_t bus, uint32_t sequence,
+                            uint64_t timestamp_us, const can_frame_t *frame)
+{
+    uint8_t raw[DK_MAX_RAW];
+    common_header(raw, type, bus, sequence, timestamp_us);
+    raw[3] = (frame->extended ? 1 : 0) | (frame->rtr ? 2 : 0) |
+             (frame->fd ? 4 : 0) | (frame->brs ? 8 : 0);
+    raw[24] = frame->fd ? s_lengths[frame->dlc & 15] : (frame->dlc > 8 ? 8 : frame->dlc);
+    dk_put(raw + 20, frame->id, 4);
+    if (!frame->rtr) memcpy(raw + 25, frame->data, raw[24]);
+    write_record(raw, 25 + raw[24]);
+}
+
 #ifdef CONFIG_DASHKIT_USB_TX
 static atomic_bool s_tx_ready;
 
@@ -276,6 +289,9 @@ static void service_tx_feedback(void)
         portEXIT_CRITICAL(&s_lock);
     }
     if (!sequence) return;
+    if (result == ESP_OK) {
+        write_can_frame(DK_TX_FRAME, bus, sequence, esp_timer_get_time(), &s_pending_tx.frame);
+    }
     const bool timed = sequence == s_repeat.sequence;
     if (timed && result == ESP_ERR_TIMEOUT && diagnostics.arbitration_only) {
         if (!stopping) {
@@ -440,18 +456,6 @@ static void read_tx_requests(void)
 }
 #endif
 
-static void write_capture_item(const capture_item_t *item)
-{
-    uint8_t raw[DK_MAX_RAW];
-    const can_frame_t *f = &item->frame.frame;
-    common_header(raw, DK_FRAME, item->frame.bus_id, item->sequence, item->timestamp_us);
-    raw[3] = (f->extended ? 1 : 0) | (f->rtr ? 2 : 0) | (f->fd ? 4 : 0) | (f->brs ? 8 : 0);
-    dk_put(raw + 20, f->id, 4);
-    raw[24] = f->fd ? s_lengths[f->dlc & 15] : (f->dlc > 8 ? 8 : f->dlc);
-    if (!f->rtr) memcpy(raw + 25, f->data, raw[24]);
-    write_record(raw, 25 + raw[24]);
-}
-
 static uint16_t utilization_permille(uint64_t busy_us, uint64_t elapsed_us)
 {
     return busy_us >= elapsed_us ? 1000 : busy_us * 1000 / elapsed_us;
@@ -513,7 +517,7 @@ static void capture_task(void *arg)
         service_repeat();
         const bool timed = s_pending_tx.deadline || s_repeat.sequence;
         if (xQueueReceive(s_queue, &item, timed ? 0 : pdMS_TO_TICKS(2)) == pdTRUE) {
-            write_capture_item(&item);
+            write_can_frame(DK_FRAME, item.frame.bus_id, item.sequence, item.timestamp_us, &item.frame.frame);
         } else if (timed) {
             // RX and TX events can wake this immediately. A tick timeout
             // still services deadlines and covers missed GPIO edges.
@@ -521,7 +525,7 @@ static void capture_task(void *arg)
         }
 #else
         if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(2)) == pdTRUE) {
-            write_capture_item(&item);
+            write_can_frame(DK_FRAME, item.frame.bus_id, item.sequence, item.timestamp_us, &item.frame.frame);
         }
 #endif
         int64_t now = esp_timer_get_time();
