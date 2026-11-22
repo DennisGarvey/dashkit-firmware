@@ -10,11 +10,16 @@
  * data[length], crc:u16. Status: queue_drops:u32, overflow_events:u32,
  * usb_aborts:u32, crc:u16. Sequence counts received frames per bus, before
  * queueing. Overflow events indicate at least one lost frame, not an exact count.
+ * Utilization (bus, flags and sequence zero): serial, CPU cores 0/1, shared
+ * SPI, and CAN buses 0/1, each as u16 per mille over the last sample interval.
  * Flags: bit0 extended, bit1 RTR, bit2 FD, bit3 BRS.
  */
 #define DK_VERSION 1
 #define DK_FRAME 0
 #define DK_STATUS 1
+#define DK_STATUS_SIZE 32
+#define DK_UTILIZATION 9
+#define DK_UTILIZATION_SIZE 32
 #define DK_MAX_RAW 91
 #define DK_MAX_WIRE 93
 
@@ -83,7 +88,14 @@ static inline size_t dk_decode(const uint8_t *wire, size_t n, uint8_t *raw)
     }
     if (out < 22 || raw[0] != DK_VERSION || raw[2] > 1 ||
         dk_get(raw + out - 2, 2) != dk_crc(raw, out - 2)) return 0;
-    if (raw[1] == DK_STATUS) return out == 34 && raw[3] == 0 ? out : 0;
+    if (raw[1] == DK_STATUS)
+        return out == DK_STATUS_SIZE + 2 && raw[3] == 0 ? out : 0;
+    if (raw[1] == DK_UTILIZATION) {
+        if (out != DK_UTILIZATION_SIZE + 2 || raw[2] || raw[3] || dk_get(raw + 8, 4)) return 0;
+        for (size_t i = 20; i < DK_UTILIZATION_SIZE; i += 2)
+            if (dk_get(raw + i, 2) > 1000) return 0;
+        return out;
+    }
     if (raw[1] != DK_FRAME || out < 27 || raw[24] > 64 ||
         out != (size_t)(27 + raw[24]) || (raw[3] & ~15)) return 0;
     if (!(raw[3] & 4) && raw[24] > 8) return 0;
