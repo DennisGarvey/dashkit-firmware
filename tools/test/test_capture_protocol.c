@@ -5,6 +5,12 @@
 int main(void)
 {
     assert(dk_crc((const uint8_t *)"123456789", 9) == 0x29b1);
+    uint8_t wanted[] = {0xa5, 0x0f}, actual[] = {0x3c, 0xf0}, mask[] = {0xf0, 0x0f};
+    assert(dk_merge_masked(wanted, actual, mask, 2));
+    assert(wanted[0] == 0xac && wanted[1] == 0xff);
+    const uint8_t current[] = {0xa1, 0x2f};
+    assert(!dk_merge_masked(wanted, current, mask, 2));
+    assert(wanted[0] == 0xa1 && wanted[1] == 0x2f);
     const uint8_t lengths[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
     for (size_t l = 0; l < sizeof(lengths); l++) {
         for (unsigned pattern = 0; pattern < 256; pattern++) {
@@ -34,5 +40,43 @@ int main(void)
     assert(dk_decode(wire, 35, decoded) == 34);
     assert(dk_decode(wire, 34, decoded) == 0);
     assert(dk_decode(wire, 0, decoded) == 0);
-    puts("Capture protocol: 4096 frame roundtrips, single-bit corruption, status and truncation passed");
+    memset(raw, 0, sizeof(raw));
+    raw[0] = DK_VERSION;
+    raw[1] = DK_TX_REPEAT;
+    dk_put(raw + 8, 42, 4);
+    dk_put(raw + 12, DK_TX_MAX_HZ, 4);
+    dk_put(raw + 16, DK_TX_MAX_DURATION_MS, 4);
+    raw[24] = 1;
+    raw[25] = 0xa5;
+    raw[26] = 0x0f;
+    assert(dk_decode(wire, dk_encode(raw, 27, wire) - 1, decoded) == 29);
+    dk_put(raw + 12, DK_TX_MAX_HZ + 1, 4);
+    assert(dk_decode(wire, dk_encode(raw, 27, wire) - 1, decoded) == 0);
+    dk_put(raw + 12, 1, 4);
+    dk_put(raw + 16, DK_TX_MIN_DURATION_MS - 1, 4);
+    assert(dk_decode(wire, dk_encode(raw, 27, wire) - 1, decoded) == 0);
+    dk_put(raw + 16, DK_TX_MIN_DURATION_MS, 4);
+    raw[26] = 0;
+    assert(dk_decode(wire, dk_encode(raw, 27, wire) - 1, decoded) == 0);
+    raw[1] = DK_TX_AUTO;
+    raw[26] = 0x0f;
+    dk_put(raw + 12, 0, 4);
+    assert(dk_decode(wire, dk_encode(raw, 27, wire) - 1, decoded) == 29);
+    dk_put(raw + 12, 1, 4);
+    assert(dk_decode(wire, dk_encode(raw, 27, wire) - 1, decoded) == 0);
+
+    memset(raw + 12, 0, 8);
+    raw[1] = DK_TX_REPEAT_CONTROL;
+    raw[20] = DK_TX_CANCEL;
+    assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 23);
+    raw[20]++;
+    assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 0);
+    raw[1] = DK_TX_REPEAT_RESULT;
+    raw[20] = DK_TX_REPEAT_CANCELLED;
+    assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 23);
+    raw[1] = DK_TX_AUTO_RESULT;
+    raw[20] = DK_TX_READY;
+    dk_put(raw + 8, 0, 4);
+    assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 23);
+    puts("Capture protocol: frame roundtrips, corruption, masked timed modes, status, and truncation passed");
 }

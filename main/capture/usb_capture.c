@@ -24,6 +24,7 @@ static QueueHandle_t s_queue;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_boot_id;
 static uint32_t s_sequence[2], s_queue_drops[2], s_overflows[2], s_usb_aborts;
+static const uint8_t s_lengths[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
 
 void usb_capture_overflow(uint8_t bus_id)
 {
@@ -39,7 +40,7 @@ void usb_capture_submit(const can_tagged_frame_t *frame)
     capture_item_t item = { .frame = *frame };
     portENTER_CRITICAL(&s_lock);
     item.sequence = ++s_sequence[frame->bus_id];
-    item.timestamp_us = esp_timer_get_time();
+    item.timestamp_us = frame->timestamp_us ? frame->timestamp_us : esp_timer_get_time();
     portEXIT_CRITICAL(&s_lock);
     if (xQueueSend(s_queue, &item, 0) != pdTRUE) {
         portENTER_CRITICAL(&s_lock);
@@ -89,19 +90,90 @@ static void common_header(uint8_t *raw, uint8_t type, uint8_t bus,
 
 #ifdef CONFIG_DASHKIT_USB_TX
 static atomic_bool s_tx_ready;
-static const uint8_t lengths[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
 
 void usb_capture_enable_tx(void)
 {
     atomic_store(&s_tx_ready, true);
 }
 
-static void write_tx_result(uint8_t bus, uint32_t sequence, uint8_t status)
+static int64_t s_next_send;
+static struct {
+    can_frame_t frame;
+    uint8_t mask[64];
+    uint32_t sequence;
+    uint8_t bus;
+    bool automatic, pending;
+    int64_t interval, next_repeat, end, lease;
+} s_repeat;
+
+static void write_tx_result(uint8_t type, uint8_t bus, uint32_t sequence, uint8_t status)
 {
     uint8_t raw[DK_MAX_RAW];
-    common_header(raw, DK_TX_RESULT, bus, sequence, esp_timer_get_time());
+    common_header(raw, type, bus, sequence, esp_timer_get_time());
     raw[20] = status;
     write_record(raw, 21);
+}
+
+static uint8_t send_frame(uint8_t bus, const can_frame_t *frame, int64_t now)
+{
+    if (now < s_next_send) return DK_TX_RATE_LIMIT;
+    s_next_send = now + 100000;
+    esp_err_t result = can_manager_send(bus, frame);
+    if (result == ESP_OK) return DK_TX_QUEUED;
+    if (result == ESP_ERR_NO_MEM) return DK_TX_FIFO_FULL;
+    if (result == ESP_ERR_TIMEOUT) return DK_TX_PREVIOUS_FAILED;
+    if (result == ESP_FAIL) return DK_TX_CONTROLLER_ERROR;
+    return DK_TX_REJECTED;
+}
+
+static void finish_repeat(uint8_t status)
+{
+    bool automatic = s_repeat.automatic;
+    uint8_t bus = s_repeat.bus;
+    uint32_t sequence = s_repeat.sequence;
+    s_repeat.sequence = 0;
+    s_repeat.pending = false;
+    if (sequence)
+        write_tx_result(automatic ? DK_TX_AUTO_RESULT : DK_TX_REPEAT_RESULT,
+                        bus, sequence, status);
+}
+
+static void observe_repeat(const can_tagged_frame_t *received)
+{
+    if (s_repeat.sequence && received->bus_id == s_repeat.bus) {
+        can_frame_t *wanted = &s_repeat.frame;
+        const can_frame_t *actual = &received->frame;
+        if (actual->id == wanted->id && actual->extended == wanted->extended) {
+            uint8_t wanted_length = wanted->fd ? s_lengths[wanted->dlc & 15] : (wanted->dlc > 8 ? 8 : wanted->dlc);
+            uint8_t actual_length = actual->fd ? s_lengths[actual->dlc & 15] : (actual->dlc > 8 ? 8 : actual->dlc);
+            bool compatible = actual->rtr == wanted->rtr && actual->fd == wanted->fd &&
+                actual->brs == wanted->brs && actual_length == wanted_length;
+            bool changed = !compatible;
+            if (compatible && !wanted->rtr)
+                changed = dk_merge_masked(wanted->data, actual->data, s_repeat.mask, wanted_length);
+            if (s_repeat.automatic && changed) s_repeat.pending = true;
+        }
+    }
+}
+
+static void service_repeat(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (!s_repeat.sequence) return;
+    if (now >= s_repeat.end) {
+        finish_repeat(DK_TX_REPEAT_FINISHED);
+    } else if (now >= s_repeat.lease || !usb_serial_jtag_is_connected()) {
+        finish_repeat(DK_TX_REPEAT_LEASE_EXPIRED);
+    } else if ((s_repeat.automatic && s_repeat.pending) ||
+               (!s_repeat.automatic && now >= s_repeat.next_repeat)) {
+        uint8_t result = send_frame(s_repeat.bus, &s_repeat.frame, now);
+        if (result == DK_TX_QUEUED) {
+            s_repeat.pending = false;
+            if (!s_repeat.automatic) s_repeat.next_repeat = now + s_repeat.interval;
+        } else if (result != DK_TX_RATE_LIMIT) {
+            finish_repeat(result);
+        }
+    }
 }
 
 static void read_tx_requests(void)
@@ -109,7 +181,6 @@ static void read_tx_requests(void)
     static uint8_t pending[DK_MAX_WIRE];
     static size_t count;
     static bool discarding;
-    static int64_t next_send;
     uint8_t bytes[256];
     int n = usb_serial_jtag_read_bytes(bytes, sizeof(bytes), 0);
     for (int i = 0; i < n; ++i) {
@@ -122,17 +193,33 @@ static void read_tx_requests(void)
         size_t size = discarding ? 0 : dk_decode(pending, count, raw);
         count = 0;
         discarding = false;
-        if (!size || raw[1] != DK_TX_REQUEST || dk_get(raw + 4, 4) != s_boot_id) continue;
+        if (!size || dk_get(raw + 4, 4) != s_boot_id || !atomic_load(&s_tx_ready)) continue;
 
         uint32_t sequence = dk_get(raw + 8, 4);
         uint8_t bus = raw[2];
         int64_t now = esp_timer_get_time();
-        if (!sequence || !atomic_load(&s_tx_ready)) continue;
-        if (now < next_send) {
-            write_tx_result(bus, sequence, DK_TX_RATE_LIMIT);
+        if (raw[1] == DK_TX_REPEAT_CONTROL) {
+            bool matches = sequence == s_repeat.sequence && bus == s_repeat.bus;
+            bool cancel = matches && raw[20] == DK_TX_CANCEL;
+            if (matches && !cancel && now < s_repeat.lease) s_repeat.lease = now + 1000000;
+            if (cancel) finish_repeat(DK_TX_REPEAT_CANCELLED);
             continue;
         }
-        next_send = now + 100000;
+        bool repeat = raw[1] == DK_TX_REPEAT;
+        bool automatic = raw[1] == DK_TX_AUTO;
+        if (!sequence || (!repeat && !automatic && raw[1] != DK_TX_REQUEST)) continue;
+        uint8_t result_type = automatic ? DK_TX_AUTO_RESULT :
+                              (repeat ? DK_TX_REPEAT_RESULT : DK_TX_RESULT);
+        bool repeat_busy = s_repeat.sequence != 0;
+        if (repeat_busy) {
+            write_tx_result(result_type, bus, sequence,
+                            repeat || automatic ? DK_TX_REPEAT_BUSY : DK_TX_RATE_LIMIT);
+            continue;
+        }
+        if (!repeat && !automatic && now < s_next_send) {
+            write_tx_result(result_type, bus, sequence, DK_TX_RATE_LIMIT);
+            continue;
+        }
         can_frame_t frame = {
             .id = dk_get(raw + 20, 4),
             .extended = (raw[3] & 1) != 0,
@@ -140,18 +227,39 @@ static void read_tx_requests(void)
             .fd = (raw[3] & 4) != 0,
             .brs = (raw[3] & 8) != 0,
         };
-        while (lengths[frame.dlc] != raw[24]) ++frame.dlc;
+        while (s_lengths[frame.dlc] != raw[24]) ++frame.dlc;
         if (!frame.rtr) memcpy(frame.data, raw + 25, raw[24]);
-        esp_err_t result = can_manager_send(bus, &frame);
-        uint8_t status = DK_TX_REJECTED;
-        if (result == ESP_OK) status = DK_TX_QUEUED;
-        else if (result == ESP_ERR_NO_MEM) status = DK_TX_FIFO_FULL;
-        else if (result == ESP_ERR_TIMEOUT) status = DK_TX_PREVIOUS_FAILED;
-        else if (result == ESP_FAIL) status = DK_TX_CONTROLLER_ERROR;
-        write_tx_result(bus, sequence, status);
+        if (repeat || automatic) {
+            s_repeat.frame = frame;
+            memcpy(s_repeat.mask, raw + 25 + raw[24], raw[24]);
+            s_repeat.bus = bus;
+            s_repeat.sequence = sequence;
+            s_repeat.automatic = automatic;
+            s_repeat.pending = true;
+            s_repeat.interval = automatic ? 0 : 1000000 / dk_get(raw + 12, 4);
+            s_repeat.next_repeat = now;
+            s_repeat.end = now + 1000 * dk_get(raw + 16, 4);
+            s_repeat.lease = now + 1000000;
+            write_tx_result(result_type, bus, sequence, DK_TX_REPEAT_STARTED);
+        } else {
+            uint8_t status = send_frame(bus, &frame, now);
+            write_tx_result(result_type, bus, sequence, status);
+        }
     }
 }
 #endif
+
+static void write_capture_item(const capture_item_t *item)
+{
+    uint8_t raw[DK_MAX_RAW];
+    const can_frame_t *f = &item->frame.frame;
+    common_header(raw, DK_FRAME, item->frame.bus_id, item->sequence, item->timestamp_us);
+    raw[3] = (f->extended ? 1 : 0) | (f->rtr ? 2 : 0) | (f->fd ? 4 : 0) | (f->brs ? 8 : 0);
+    dk_put(raw + 20, f->id, 4);
+    raw[24] = f->fd ? s_lengths[f->dlc & 15] : (f->dlc > 8 ? 8 : f->dlc);
+    if (!f->rtr) memcpy(raw + 25, f->data, raw[24]);
+    write_record(raw, 25 + raw[24]);
+}
 
 static void capture_task(void *arg)
 {
@@ -162,17 +270,13 @@ static void capture_task(void *arg)
     while (true) {
 #ifdef CONFIG_DASHKIT_USB_TX
         read_tx_requests();
+        service_repeat();
 #endif
         if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(2)) == pdTRUE) {
-            uint8_t raw[DK_MAX_RAW];
-            const can_frame_t *f = &item.frame.frame;
-            common_header(raw, DK_FRAME, item.frame.bus_id, item.sequence, item.timestamp_us);
-            raw[3] = (f->extended ? 1 : 0) | (f->rtr ? 2 : 0) | (f->fd ? 4 : 0) | (f->brs ? 8 : 0);
-            dk_put(raw + 20, f->id, 4);
-            static const uint8_t lengths[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
-            raw[24] = f->fd ? lengths[f->dlc & 15] : (f->dlc > 8 ? 8 : f->dlc);
-            if (!f->rtr) memcpy(raw + 25, f->data, raw[24]);
-            write_record(raw, 25 + raw[24]);
+#ifdef CONFIG_DASHKIT_USB_TX
+            observe_repeat(&item.frame);
+#endif
+            write_capture_item(&item);
         }
         int64_t now = esp_timer_get_time();
         if (now >= next_status) {
@@ -187,7 +291,10 @@ static void capture_task(void *arg)
                 write_record(raw, 32);
             }
 #ifdef CONFIG_DASHKIT_USB_TX
-            if (atomic_load(&s_tx_ready)) write_tx_result(0, 0, DK_TX_READY);
+            if (atomic_load(&s_tx_ready))
+                write_tx_result(DK_TX_RESULT, DK_TX_REPEAT_CAPABILITY, 0, DK_TX_READY);
+            if (atomic_load(&s_tx_ready))
+                write_tx_result(DK_TX_AUTO_RESULT, 0, 0, DK_TX_READY);
 #endif
             next_status = now + 1000000;
         }
