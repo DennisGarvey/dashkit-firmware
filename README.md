@@ -140,27 +140,14 @@ FLASH_BUILD=build-usb-tx
 ```
 
 #### 2. Prepare the adapter
-
-1. Disconnect both CAN buses from the adapter before resetting into the
-   bootloader. The external CAN controllers can remain powered across an
-   ESP32 reset. Disconnecting also prevents the newly flashed firmware from
-   participating in bus traffic as soon as it boots.
-2. Connect the adapter over USB. In Cabana, use **File → Close stream** and
+1. Connect the adapter over USB. In Cabana, use **File → Close stream** and
    close any serial monitor that has the device open.
-3. Find the adapter's port with `ls /dev/cu.usbmodem*`. If several devices
+2. Find the adapter's port with `ls /dev/cu.usbmodem*`. If several devices
    appear, unplug and reconnect the adapter to identify its port.
 
 ```bash
 FLASH_PORT=/dev/cu.usbmodem2101  # Replace with the adapter's port.
 ```
-
-Before replacing an existing installation you want to preserve, back up the
-device and verify that the backup is readable. Check its partition layout,
-active OTA slot and flash security state before writing. The command below
-installs the selected build's bootloader, partition table, application and
-initial OTA data. It can change which application boots. If you need to retain
-the installed partition layout and OTA state, use an application-only update
-targeting the verified slot for that device.
 
 #### 3. Write and verify
 

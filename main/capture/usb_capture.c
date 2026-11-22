@@ -71,14 +71,27 @@ void usb_capture_notify_tx_event(void)
 }
 
 static portMUX_TYPE s_repeat_lock = portMUX_INITIALIZER_UNLOCKED;
+typedef struct {
+    uint16_t start_bit;
+    uint8_t size;
+    bool little_endian;
+} counter_descriptor_t;
+
 static struct {
     can_frame_t frame;
     uint8_t mask[64], selector[64];
     uint32_t sequence;
     uint8_t bus, finish_status;
-    bool automatic, pending, retry_pending, automatic_needs_send;
+    bool automatic, pending, retry_pending, automatic_needs_send, increment_counter;
+    counter_descriptor_t counter;
     int64_t interval, next_repeat, end, lease;
 } s_repeat;
+
+static void increment_counter(can_frame_t *frame, const counter_descriptor_t *counter)
+{
+    dk_increment_counter(frame->data, counter->start_bit, counter->size,
+                         counter->little_endian);
+}
 
 // Refresh the payload at CAN ingress even if USB capture is backlogged.
 static void observe_repeat(const can_tagged_frame_t *received)
@@ -350,6 +363,7 @@ static void service_repeat(void)
                      (s_repeat.automatic ? s_repeat.pending : now >= s_repeat.next_repeat);
     if (due) {
         frame = s_repeat.frame;
+        if (s_repeat.increment_counter) increment_counter(&frame, &s_repeat.counter);
         s_repeat.pending = false;
         s_repeat.retry_pending = false;
     }
@@ -422,6 +436,14 @@ static void read_tx_requests(void)
         };
         while (s_lengths[frame.dlc] != raw[24]) ++frame.dlc;
         if (!frame.rtr) memcpy(frame.data, raw + 25, raw[24]);
+        const bool increment = (raw[3] & DK_TX_INCREMENT_COUNTER) != 0;
+        counter_descriptor_t counter = {0};
+        if (increment) {
+            const size_t at = size - 2 - 3;
+            counter.start_bit = (uint16_t)dk_get(raw + at, 2);
+            counter.size = raw[at + 2] & 0x7f;
+            counter.little_endian = (raw[at + 2] & 0x80) != 0;
+        }
         if (repeat || automatic) {
             if (frame.rtr) {
                 write_tx_result(result_type, bus, sequence, DK_TX_REJECTED);
@@ -439,6 +461,8 @@ static void read_tx_requests(void)
             s_repeat.pending = true;
             s_repeat.retry_pending = false;
             s_repeat.automatic_needs_send = true;
+            s_repeat.increment_counter = increment;
+            s_repeat.counter = counter;
             portEXIT_CRITICAL(&s_repeat_lock);
             s_repeat.finish_status = 0;
             uint32_t hz = dk_get(raw + 12, 4);
@@ -449,6 +473,7 @@ static void read_tx_requests(void)
             write_tx_result(result_type, bus, sequence, DK_TX_REPEAT_STARTED);
         } else {
             s_next_manual_send = now + 100000;
+            if (increment) increment_counter(&frame, &counter);
             uint8_t status = send_frame(bus, &frame, sequence);
             write_tx_result(result_type, bus, sequence, status);
         }
@@ -543,9 +568,7 @@ static void capture_task(void *arg)
             }
 #ifdef CONFIG_DASHKIT_USB_TX
             if (atomic_load(&s_tx_ready)) {
-                write_tx_result(DK_TX_FEEDBACK, 0, 0, DK_TX_READY);
-                write_tx_result(DK_TX_RESULT, DK_TX_REPEAT_CAPABILITY, 0, DK_TX_READY);
-                write_tx_result(DK_TX_AUTO_RESULT, 0, 0, DK_TX_READY);
+                write_tx_result(DK_TX_RESULT, DK_TX_CAPABILITY, 0, DK_TX_READY);
             }
 #endif
             next_status = now + 1000000;

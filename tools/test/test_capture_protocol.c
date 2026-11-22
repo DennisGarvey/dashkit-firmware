@@ -99,7 +99,25 @@ int main(void)
     dk_put(raw + 12, 1, 4);
     assert(dk_decode(wire, dk_encode(raw, 27, wire) - 1, decoded) == 0);
 
+    // Counter descriptors are validated and both DBC bit orders increment
+    // from the supplied live-frame value with width-based rollover.
+    raw[3] = DK_TX_INCREMENT_COUNTER;
+    dk_put(raw + 12, 0, 4);
+    raw[26] = 0x0f;
+    dk_put(raw + 27, 0, 2);
+    raw[29] = 0x84;  // Four-bit little-endian counter at bit zero.
+    assert(dk_decode(wire, dk_encode(raw, 30, wire) - 1, decoded) == 32);
+    uint8_t little[] = {0xaf};
+    dk_increment_counter(little, 0, 4, true);
+    assert(little[0] == 0xa0);
+    uint8_t motorola[] = {0x0f, 0xf5};
+    dk_increment_counter(motorola, 3, 8, false);
+    assert(motorola[0] == 0x00 && motorola[1] == 0x05);
+    raw[29] = 0x80;  // Zero-width descriptors are invalid.
+    assert(dk_decode(wire, dk_encode(raw, 30, wire) - 1, decoded) == 0);
+
     memset(raw + 12, 0, 8);
+    raw[3] = 0;
     raw[1] = DK_TX_REPEAT_CONTROL;
     raw[20] = DK_TX_CANCEL;
     assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 23);
