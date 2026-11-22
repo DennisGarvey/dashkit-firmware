@@ -115,6 +115,16 @@ int main(void)
     assert(motorola[0] == 0x00 && motorola[1] == 0x05);
     raw[29] = 0x80;  // Zero-width descriptors are invalid.
     assert(dk_decode(wire, dk_encode(raw, 30, wire) - 1, decoded) == 0);
+    raw[3] = DK_TX_INCREMENT_COUNTER | DK_TX_RECALCULATE_CHECKSUM;
+    raw[29] = 0x84;
+    raw[30] = 0;
+    assert(dk_decode(wire, dk_encode(raw, 31, wire) - 1, decoded) == 33);
+    raw[30] = 1;  // Checksum byte must be inside the payload.
+    assert(dk_decode(wire, dk_encode(raw, 31, wire) - 1, decoded) == 0);
+    uint8_t protected_frame[] = {0xaa, 0x0f, 0x00};
+    dk_increment_counter(protected_frame, 8, 4, true);
+    dk_recalculate_tesla_checksum(protected_frame, 3, 0x249, 0);
+    assert(protected_frame[0] == 0x4b && protected_frame[1] == 0x00);
 
     memset(raw + 12, 0, 8);
     raw[3] = 0;

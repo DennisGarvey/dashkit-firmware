@@ -82,7 +82,8 @@ static struct {
     uint8_t mask[64], selector[64];
     uint32_t sequence;
     uint8_t bus, finish_status;
-    bool automatic, pending, retry_pending, automatic_needs_send, increment_counter;
+    bool automatic, pending, retry_pending, automatic_needs_send, increment_counter, recalculate_checksum;
+    uint8_t checksum_byte;
     counter_descriptor_t counter;
     int64_t interval, next_repeat, end, lease;
 } s_repeat;
@@ -364,6 +365,9 @@ static void service_repeat(void)
     if (due) {
         frame = s_repeat.frame;
         if (s_repeat.increment_counter) increment_counter(&frame, &s_repeat.counter);
+        if (s_repeat.recalculate_checksum)
+            dk_recalculate_tesla_checksum(frame.data, s_lengths[frame.dlc], frame.id,
+                                          s_repeat.checksum_byte);
         s_repeat.pending = false;
         s_repeat.retry_pending = false;
     }
@@ -437,13 +441,15 @@ static void read_tx_requests(void)
         while (s_lengths[frame.dlc] != raw[24]) ++frame.dlc;
         if (!frame.rtr) memcpy(frame.data, raw + 25, raw[24]);
         const bool increment = (raw[3] & DK_TX_INCREMENT_COUNTER) != 0;
+        const bool checksum = (raw[3] & DK_TX_RECALCULATE_CHECKSUM) != 0;
         counter_descriptor_t counter = {0};
         if (increment) {
-            const size_t at = size - 2 - 3;
+            const size_t at = size - 2 - (checksum ? 1 : 0) - 3;
             counter.start_bit = (uint16_t)dk_get(raw + at, 2);
             counter.size = raw[at + 2] & 0x7f;
             counter.little_endian = (raw[at + 2] & 0x80) != 0;
         }
+        const uint8_t checksum_byte = checksum ? raw[size - 3] : 0;
         if (repeat || automatic) {
             if (frame.rtr) {
                 write_tx_result(result_type, bus, sequence, DK_TX_REJECTED);
@@ -463,6 +469,8 @@ static void read_tx_requests(void)
             s_repeat.automatic_needs_send = true;
             s_repeat.increment_counter = increment;
             s_repeat.counter = counter;
+            s_repeat.recalculate_checksum = checksum;
+            s_repeat.checksum_byte = checksum_byte;
             portEXIT_CRITICAL(&s_repeat_lock);
             s_repeat.finish_status = 0;
             uint32_t hz = dk_get(raw + 12, 4);
@@ -474,6 +482,9 @@ static void read_tx_requests(void)
         } else {
             s_next_manual_send = now + 100000;
             if (increment) increment_counter(&frame, &counter);
+            if (checksum)
+                dk_recalculate_tesla_checksum(frame.data, s_lengths[frame.dlc], frame.id,
+                                              checksum_byte);
             uint8_t status = send_frame(bus, &frame, sequence);
             write_tx_result(result_type, bus, sequence, status);
         }
