@@ -40,5 +40,16 @@ int main(void)
     assert(dk_decode(wire, dk_encode(raw, DK_UTILIZATION_SIZE, wire) - 1, decoded) == DK_UTILIZATION_SIZE + 2);
     dk_put(raw + 30, 1001, 2);
     assert(dk_decode(wire, dk_encode(raw, DK_UTILIZATION_SIZE, wire) - 1, decoded) == 0);
+    memset(raw, 0, sizeof(raw));
+    raw[0] = DK_VERSION;
+    raw[1] = DK_SESSION;
+    for (uint8_t opcode = DK_SESSION_START; opcode <= DK_SESSION_STOP; opcode++) {
+        raw[20] = opcode;
+        dk_put(raw + 12, 0x0123456789abcdefULL, 8);
+        assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 23);
+        assert(dk_get(decoded + 12, 8) == 0x0123456789abcdefULL);
+    }
+    dk_put(raw + 12, 0, 8);
+    assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 0);
     puts("Capture protocol: 4096 frame roundtrips, single-bit corruption, status and truncation passed");
 }

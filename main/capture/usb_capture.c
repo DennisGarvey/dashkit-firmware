@@ -16,12 +16,15 @@
 typedef struct {
     can_tagged_frame_t frame;
     uint64_t timestamp_us;
-    uint32_t sequence;
+    uint32_t sequence, generation;
 } capture_item_t;
 
 static QueueHandle_t s_queue;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t s_boot_id;
+static uint32_t s_boot_id, s_next_generation;
+static atomic_uint s_capture_generation;
+static uint64_t s_session_id;
+static int64_t s_session_deadline;
 static uint32_t s_sequence[2], s_queue_drops[2], s_overflows[2], s_usb_aborts;
 
 static const uint8_t s_lengths[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
@@ -69,8 +72,14 @@ void usb_capture_overflow(uint8_t bus_id)
 void usb_capture_submit(const can_tagged_frame_t *frame)
 {
     if (!s_queue || frame->bus_id > 1) return;
-    capture_item_t item = { .frame = *frame };
+    const uint32_t generation = atomic_load_explicit(&s_capture_generation, memory_order_relaxed);
+    if (!generation) return;
+    capture_item_t item = { .frame = *frame, .generation = generation };
     portENTER_CRITICAL(&s_lock);
+    if (generation != atomic_load_explicit(&s_capture_generation, memory_order_relaxed)) {
+        portEXIT_CRITICAL(&s_lock);
+        return;
+    }
     account_can_frame(frame->bus_id, &frame->frame);
     item.sequence = ++s_sequence[frame->bus_id];
     item.timestamp_us = esp_timer_get_time();
@@ -87,9 +96,9 @@ void usb_capture_submit(const can_tagged_frame_t *frame)
 static uint8_t s_output[2048];
 static size_t s_output_size;
 
-static void flush_records(void)
+static bool flush_records(void)
 {
-    if (!s_output_size) return;
+    if (!s_output_size) return true;
     size_t sent = 0;
     while (sent < s_output_size) {
         int n = usb_serial_jtag_write_bytes(s_output + sent, s_output_size - sent, pdMS_TO_TICKS(10));
@@ -100,7 +109,9 @@ static void flush_records(void)
         s_serial_bytes += (uint32_t)n;
         sent += (size_t)n;
     }
+    const bool complete = sent == s_output_size;
     s_output_size = 0;
+    return complete;
 }
 
 static void write_record(uint8_t *raw, size_t size)
@@ -120,6 +131,71 @@ static void common_header(uint8_t *raw, uint8_t type, uint8_t bus,
     dk_put(raw + 4, s_boot_id, 4);
     dk_put(raw + 8, sequence, 4);
     dk_put(raw + 12, timestamp_us, 8);
+}
+
+static void set_capture_generation(uint32_t generation)
+{
+    portENTER_CRITICAL(&s_lock);
+    atomic_store_explicit(&s_capture_generation, generation, memory_order_relaxed);
+    portEXIT_CRITICAL(&s_lock);
+}
+
+static void stop_capture_session(void)
+{
+    set_capture_generation(0);
+    s_session_id = 0;
+    s_output_size = 0;
+    xQueueReset(s_queue);
+}
+
+static void handle_session_request(uint64_t id, uint8_t opcode, int64_t now)
+{
+    if (opcode == DK_SESSION_START) {
+        const bool new_session = id != s_session_id;
+        if (new_session) stop_capture_session();
+        uint8_t raw[DK_MAX_RAW];
+        common_header(raw, DK_SESSION, 0, 0, id);
+        raw[20] = DK_SESSION_READY;
+        write_record(raw, 21);
+        // ESP-IDF delivers any previously written bytes before this reply.
+        if (flush_records()) {
+            s_session_id = id;
+            s_session_deadline = now + 3000000;
+            if (new_session) {
+                if (++s_next_generation == 0) ++s_next_generation;
+                set_capture_generation(s_next_generation);
+            }
+        }
+    } else if (id == s_session_id && now < s_session_deadline) {
+        if (opcode == DK_SESSION_KEEPALIVE) s_session_deadline = now + 3000000;
+        if (opcode == DK_SESSION_STOP) stop_capture_session();
+    }
+}
+
+static void read_usb_requests(void)
+{
+    static uint8_t pending[DK_MAX_WIRE];
+    static size_t count;
+    static bool discarding;
+    uint8_t bytes[256];
+    int n = usb_serial_jtag_read_bytes(bytes, sizeof(bytes), 0);
+    if (n > 0) s_serial_bytes += (uint32_t)n;
+    for (int i = 0; i < n; ++i) {
+        if (bytes[i]) {
+            if (count == sizeof(pending)) discarding = true;
+            if (!discarding) pending[count++] = bytes[i];
+            continue;
+        }
+        uint8_t raw[DK_MAX_RAW];
+        size_t size = discarding ? 0 : dk_decode(pending, count, raw);
+        count = 0;
+        discarding = false;
+        if (!size) continue;
+        if (raw[1] == DK_SESSION) {
+            handle_session_request(dk_get(raw + 12, 8), raw[20], esp_timer_get_time());
+            continue;
+        }
+    }
 }
 
 static uint16_t utilization_permille(uint64_t busy_us, uint64_t elapsed_us)
@@ -175,9 +251,17 @@ static void capture_task(void *arg)
     (void)arg;
     int64_t next_status = 0;
     int64_t next_flush = 0;
+    int64_t next_control_poll = 0;
     capture_item_t item;
     while (true) {
-        if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(2)) == pdTRUE) {
+        const int64_t loop_time = esp_timer_get_time();
+        if (s_session_id && loop_time >= s_session_deadline) stop_capture_session();
+        if (loop_time >= next_control_poll) {
+            read_usb_requests();
+            next_control_poll = loop_time + 1000;
+        }
+        if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(2)) == pdTRUE &&
+            item.generation == atomic_load_explicit(&s_capture_generation, memory_order_relaxed)) {
             uint8_t raw[DK_MAX_RAW];
             const can_frame_t *f = &item.frame.frame;
             common_header(raw, DK_FRAME, item.frame.bus_id, item.sequence, item.timestamp_us);
@@ -188,7 +272,7 @@ static void capture_task(void *arg)
             write_record(raw, 25 + raw[24]);
         }
         int64_t now = esp_timer_get_time();
-        if (now >= next_status) {
+        if (s_session_id && now >= next_status) {
             write_utilization(now);
             for (uint8_t bus = 0; bus < 2; bus++) {
                 uint8_t raw[DK_MAX_RAW];
