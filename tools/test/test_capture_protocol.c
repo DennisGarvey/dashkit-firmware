@@ -150,5 +150,16 @@ int main(void)
     dk_put(raw + 8, 2, 4);
     assert(dk_decode(wire, dk_encode(raw, 26, wire) - 1, decoded) == 28);
     assert(decoded[25] == 42);
+    memset(raw, 0, sizeof(raw));
+    raw[0] = DK_VERSION;
+    raw[1] = DK_SESSION;
+    for (uint8_t opcode = DK_SESSION_START; opcode <= DK_SESSION_STOP; opcode++) {
+        raw[20] = opcode;
+        dk_put(raw + 12, 0x0123456789abcdefULL, 8);
+        assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 23);
+        assert(dk_get(decoded + 12, 8) == 0x0123456789abcdefULL);
+    }
+    dk_put(raw + 12, 0, 8);
+    assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 0);
     puts("Capture protocol: frame roundtrips, corruption, masked timed modes, status, and truncation passed");
 }
