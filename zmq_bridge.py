@@ -390,11 +390,8 @@ class TerminalStatus:
         else:
             capture.extend([receive, breakdown])
         capture.append(f'Total Frames: {self.total_frames:,}')
-        live_hint = '↑ for Log History'
-        history_hint = 'Log History · End to Follow'
-        hint = history_hint if self.log_cursor >= 0 else live_hint
-        capture.append(hint.ljust(len(history_hint)))
-        return [line.rstrip() for line in self._wrap_fields(capture, width)]
+        capture.append('End: Live Log' if self.log_cursor >= 0 else '↑ Log History')
+        return self._wrap_fields(capture, width)
 
     def _metric_groups(self):
         return [
