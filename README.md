@@ -64,6 +64,6 @@ Firmware log lines appear with a `[FIRMWARE]` label. On color terminals, errors 
 - **Invalid USB Records** count records the bridge rejects, such as malformed records, CRC failures, or duplicate or out-of-order CAN frame numbers.
 - **Device Reboots** count changes in the firmware boot ID observed by the bridge.
 
-Use Page Up and Page Down to scroll the retained log, Home to jump to the oldest entries, and End to resume following live output. The bridge retains the latest 2,000 log lines while it runs.
+Use Up and Down to move the cursor through the log. The pane scrolls when the cursor reaches an edge. Left and Right move across a line. Home jumps to the oldest retained entry and End resumes following live output, with the cursor on the next blank line. The bridge retains the latest 2,000 log lines while it runs.
 
 Use `--no-status` for plain-text logs and metrics when redirecting output or using a terminal without curses. Run `python zmq_bridge.py --help` to see all options.

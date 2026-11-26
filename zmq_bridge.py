@@ -270,9 +270,11 @@ class TerminalStatus:
         self.port = None
         self.logs = deque(maxlen=2000)
         self.log_offset = 0
+        self.log_cursor = -1  # Rows back from the newest log. -1 follows live output.
+        self.log_cursor_column = 0
+        self.log_line_lengths = []
         self.log_rows = 1
         self.log_columns = 1
-        self.max_log_offset = 0
         self.screen = None
         self.firmware_colors = {}
         self.enabled = bool(enabled and curses is not None
@@ -316,18 +318,24 @@ class TerminalStatus:
                 self.firmware_colors.clear()
 
     def _poll_terminal(self):
-        offset = self.log_offset
+        cursor = self.log_cursor, self.log_cursor_column
         while (key := self.screen.getch()) != -1:
-            if key == curses.KEY_PPAGE:
-                self.log_offset += self.log_rows
-            elif key == curses.KEY_NPAGE:
-                self.log_offset -= self.log_rows
+            if key == curses.KEY_UP:
+                self.log_cursor = min(self.log_cursor + 1, len(self.log_line_lengths) - 1)
+            elif key == curses.KEY_DOWN:
+                self.log_cursor = max(-1, self.log_cursor - 1)
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT) and 0 <= self.log_cursor < len(self.log_line_lengths):
+                length = self.log_line_lengths[-1 - self.log_cursor]
+                column = min(self.log_cursor_column, length)
+                self.log_cursor_column = max(0, min(length, column + (1 if key == curses.KEY_RIGHT else -1)))
             elif key == curses.KEY_HOME:
-                self.log_offset = self.max_log_offset
+                self.log_cursor = len(self.log_line_lengths) - 1
+                self.log_cursor_column = 0
             elif key == curses.KEY_END:
-                self.log_offset = 0
-            self.log_offset = min(max(0, self.log_offset), self.max_log_offset)
-        changed = offset != self.log_offset
+                self.log_cursor = -1
+            if self.log_cursor < 0:
+                self.log_cursor_column = 0
+        changed = cursor != (self.log_cursor, self.log_cursor_column)
         try:
             size = os.get_terminal_size(sys.stdout.fileno())
         except OSError:
@@ -369,7 +377,7 @@ class TerminalStatus:
     def _header_lines(self, width):
         b0, b1 = self.rates
         capture = [f' DashKit USB · {self.state}']
-        if self.log_offset:
+        if self.log_cursor >= 0:
             capture.append('Log History · End to Follow')
         if self.port:
             capture.append(self.port)
@@ -380,8 +388,8 @@ class TerminalStatus:
         else:
             capture.extend([receive, breakdown])
         capture.append(f'Total Frames: {sum(self.stream.frames):,}')
-        if not self.log_offset:
-            capture.append('PgUp for Log History')
+        if self.log_cursor < 0:
+            capture.append('↑ for Log History')
         return self._wrap_fields(capture, width)
 
     def _capture_counter_fields(self):
@@ -424,14 +432,21 @@ class TerminalStatus:
                 log_columns = self.log_columns
                 wrapped = [(line[start:start + log_columns], style) for line, style in self.logs
                            for start in range(0, max(1, len(line)), log_columns)]
-                self.max_log_offset = max(0, len(wrapped) - self.log_rows)
-                self.log_offset = min(self.log_offset, self.max_log_offset)
+                self.log_line_lengths = [len(line) for line, _ in wrapped]
+                self.log_cursor = min(self.log_cursor, len(wrapped) - 1)
+                if self.log_cursor < 0:
+                    self.log_offset = 0
+                else:
+                    # Scroll the pane only when the selected row leaves the viewport.
+                    max_offset = max(0, len(wrapped) - self.log_rows)
+                    self.log_offset = max(self.log_cursor - self.log_rows + 1,
+                                          min(self.log_offset, self.log_cursor, max_offset))
                 end = len(wrapped) - self.log_offset
                 visible = wrapped[max(0, end - log_space):end]
                 for row, (line, style) in enumerate(visible, len(header)):
                     self.screen.addnstr(row, 0, line, log_columns, style)
                 if sidebar:
-                    self.screen.vline(len(header), sidebar_column, curses.ACS_VLINE, log_space)
+                    self.screen.vline(len(header), sidebar_column, curses.ACS_VLINE, pane_rows)
                     for row, field in enumerate(side_rows, len(header)):
                         label, separator, value = field.partition(': ')
                         if separator:
@@ -444,7 +459,11 @@ class TerminalStatus:
                 for row, line in enumerate(footer, footer_start):
                     self.screen.addnstr(row, 0, line, columns)
                 next_log_row = len(header) + len(visible)
-                if next_log_row < divider:
+                if visible and self.log_cursor >= 0:
+                    index = len(visible) - 1 - (self.log_cursor - self.log_offset)
+                    line, _ = visible[index]
+                    self.screen.move(len(header) + index, min(self.log_cursor_column, len(line)))
+                elif next_log_row < divider:
                     self.screen.move(next_log_row, 0)
                 elif visible:
                     last_line, _ = visible[-1]
@@ -462,9 +481,10 @@ class TerminalStatus:
         timestamp = time.strftime('%H:%M:%S')
         lines = [f'[{timestamp}] {line}' if line else '' for line in lines]
         self.logs.extend((line, style) for line in lines)
-        if self.log_offset:
-            self.log_offset += sum(max(1, (len(line) + self.log_columns - 1) // self.log_columns)
-                                   for line in lines)
+        if self.log_cursor >= 0:
+            added = sum(max(1, (len(line) + self.log_columns - 1) // self.log_columns) for line in lines)
+            self.log_cursor += added
+            self.log_offset += added
         if redraw:
             self._draw()
 
