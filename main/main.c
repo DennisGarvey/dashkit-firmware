@@ -2,6 +2,9 @@
 #include "led.h"
 #include "can_interface.h"
 #include "can_manager.h"
+#ifdef CONFIG_DASHKIT_USB_STREAM
+#include "usb_capture.h"
+#endif
 #include "can_filter.h"
 #include "dbc.h"
 #include "automation_manager.h"
@@ -145,6 +148,9 @@ static void can_to_ble_task(void *arg)
 
 void app_main(void)
 {
+#ifdef CONFIG_DASHKIT_USB_STREAM
+    usb_capture_install_log_sink();
+#endif
     ESP_LOGI(TAG, "DashKit firmware starting... (reset reason=%d)",
              (int)esp_reset_reason());
 

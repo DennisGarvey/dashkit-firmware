@@ -2,8 +2,10 @@
 #include "capture_protocol.h"
 #include "board.h"
 #include <stdatomic.h>
+#include <stdio.h>
 
 #include "driver/usb_serial_jtag.h"
+#include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -33,6 +35,43 @@ static uint32_t s_sequence[2], s_queue_drops[2], s_overflows[2], s_usb_aborts;
 static atomic_uint s_spi_bits[2];
 static uint32_t s_serial_bytes;
 static uint32_t s_can_bits[2];
+
+// Keep recent startup messages even before the host opens a capture session.
+// Logging may run on either core. Format outside the lock and never wait for
+// USB from inside the logging hook.
+#define LOG_HISTORY_DEPTH 32
+typedef struct {
+    int64_t timestamp_us;
+    size_t length;
+    char text[DK_LOG_MAX_TEXT + 1];
+} log_entry_t;
+
+static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
+static log_entry_t s_logs[LOG_HISTORY_DEPTH];
+static unsigned s_log_write, s_log_count;
+
+static int capture_log_vprintf(const char *format, va_list args)
+{
+    log_entry_t entry = { .timestamp_us = esp_timer_get_time() };
+    int length = vsnprintf(entry.text, sizeof(entry.text), format, args);
+    if (length <= 0) return length;
+    entry.length = length;
+    if (entry.length >= sizeof(entry.text)) {
+        entry.length = DK_LOG_MAX_TEXT;
+        memcpy(entry.text + entry.length - 4, "...\n", 4);
+    }
+    portENTER_CRITICAL(&s_log_lock);
+    s_logs[s_log_write] = entry;
+    s_log_write = (s_log_write + 1) % LOG_HISTORY_DEPTH;
+    if (s_log_count < LOG_HISTORY_DEPTH) s_log_count++;
+    portEXIT_CRITICAL(&s_log_lock);
+    return length;
+}
+
+void usb_capture_install_log_sink(void)
+{
+    esp_log_set_vprintf(capture_log_vprintf);
+}
 
 void usb_capture_account_spi(uint8_t bus_id, uint32_t clock_bits)
 {
@@ -118,6 +157,24 @@ static void common_header(uint8_t *raw, uint8_t type, uint8_t bus,
     dk_put(raw + 4, s_boot_id, 4);
     dk_put(raw + 8, sequence, 4);
     dk_put(raw + 12, timestamp_us, 8);
+}
+
+static void write_log_record(void)
+{
+    log_entry_t entry;
+    portENTER_CRITICAL(&s_log_lock);
+    if (!s_log_count) {
+        portEXIT_CRITICAL(&s_log_lock);
+        return;
+    }
+    entry = s_logs[(s_log_write + LOG_HISTORY_DEPTH - s_log_count) % LOG_HISTORY_DEPTH];
+    s_log_count--;
+    portEXIT_CRITICAL(&s_log_lock);
+
+    uint8_t raw[DK_MAX_RAW];
+    common_header(raw, DK_LOG, 0, 0, entry.timestamp_us);
+    memcpy(raw + 20, entry.text, entry.length);
+    write_record(raw, 20 + entry.length);
 }
 
 static void set_capture_generation(uint32_t generation)
@@ -237,6 +294,7 @@ static void capture_task(void *arg)
     int64_t next_status = 0;
     int64_t next_flush = 0;
     int64_t next_control_poll = 0;
+    int64_t next_log = 0;
     capture_item_t item;
     while (true) {
         const int64_t loop_time = esp_timer_get_time();
@@ -257,6 +315,11 @@ static void capture_task(void *arg)
             write_record(raw, 25 + raw[24]);
         }
         int64_t now = esp_timer_get_time();
+        // Keep log bursts from competing with sustained CAN capture.
+        if (s_session_id && now >= next_log) {
+            write_log_record();
+            next_log = now + 4000;
+        }
         if (s_session_id && now >= next_status) {
             write_utilization(now);
             for (uint8_t bus = 0; bus < 2; bus++) {

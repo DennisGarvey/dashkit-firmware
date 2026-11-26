@@ -51,5 +51,15 @@ int main(void)
     }
     dk_put(raw + 12, 0, 8);
     assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 0);
-    puts("Capture protocol: 4096 frame roundtrips, single-bit corruption, status and truncation passed");
+    memset(raw, 0, sizeof(raw));
+    raw[0] = DK_VERSION;
+    raw[1] = DK_LOG;
+    assert(dk_decode(wire, dk_encode(raw, 20, wire) - 1, decoded) == 0);
+    memset(raw + 20, 'L', DK_LOG_MAX_TEXT);
+    assert(dk_decode(wire, dk_encode(raw, 20 + DK_LOG_MAX_TEXT, wire) - 1, decoded) ==
+           22 + DK_LOG_MAX_TEXT);
+    assert(memcmp(raw + 20, decoded + 20, DK_LOG_MAX_TEXT) == 0);
+    raw[3] = 1;
+    assert(dk_decode(wire, dk_encode(raw, 20 + DK_LOG_MAX_TEXT, wire) - 1, decoded) == 0);
+    puts("Capture protocol: 4096 frame roundtrips, single-bit corruption, status, truncation and firmware logs passed");
 }

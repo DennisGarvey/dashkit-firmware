@@ -14,6 +14,9 @@
  * SPI, and CAN buses 0/1, each as u16 per mille over the last sample interval.
  * Session control uses a nonzero u64 session ID in the time field and
  * one opcode at offset 20. Bus, flags and sequence are zero.
+ * The device may send LOG records during an active capture session.
+ * They use the common header followed by UTF-8 text and CRC, with bus,
+ * flags and sequence zero.
  * Flags: bit0 extended, bit1 RTR, bit2 FD, bit3 BRS.
  */
 #define DK_VERSION 1
@@ -27,8 +30,10 @@
 #define DK_SESSION_READY 1
 #define DK_SESSION_KEEPALIVE 2
 #define DK_SESSION_STOP 3
-#define DK_MAX_RAW 91
-#define DK_MAX_WIRE 93
+#define DK_LOG 13
+#define DK_LOG_MAX_TEXT 199
+#define DK_MAX_RAW 223
+#define DK_MAX_WIRE 225
 
 static inline void dk_put(uint8_t *p, uint64_t value, size_t n)
 {
@@ -98,6 +103,10 @@ static inline size_t dk_decode(const uint8_t *wire, size_t n, uint8_t *raw)
     if (raw[1] == DK_SESSION)
         return out == 23 && !raw[2] && !raw[3] && !dk_get(raw + 8, 4) &&
             dk_get(raw + 12, 8) && raw[20] <= DK_SESSION_STOP ? out : 0;
+    // Log text follows the common header. Only the device sends log records.
+    if (raw[1] == DK_LOG)
+        return out > 22 && out <= 22 + DK_LOG_MAX_TEXT &&
+            !raw[2] && !raw[3] && !dk_get(raw + 8, 4) ? out : 0;
     if (raw[1] == DK_STATUS)
         return out == DK_STATUS_SIZE + 2 && raw[3] == 0 ? out : 0;
     if (raw[1] == DK_UTILIZATION) {
