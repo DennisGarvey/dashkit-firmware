@@ -266,7 +266,7 @@ class TerminalStatus:
 
     def __init__(self, stream, enabled=True):
         self.stream = stream
-        self.state = 'WAITING FOR USB'
+        self.state = 'Waiting for USB'
         self.port = None
         self.logs = deque(maxlen=2000)
         self.log_offset = 0
@@ -348,12 +348,12 @@ class TerminalStatus:
         status = self.stream.status
         drops = ' / '.join(f'B{bus} {values[0]:,}' if values is not None else f'B{bus} —'
                            for bus, values in enumerate(status))
-        fifos = [f'CAN controller FIFO {label} overflows: {values[1]:,}'
-                 if values is not None else f'CAN controller FIFO {label} overflows: —'
+        fifos = [f'CAN Controller FIFO {label} Overflows: {values[1]:,}'
+                 if values is not None else f'CAN Controller FIFO {label} Overflows: —'
                  for label, values in zip('AB', status)]
         aborts = self.stream.usb_aborts
-        return [f'Capture queue drops: {drops}', *fifos,
-                f'USB write aborts: {aborts:,}' if aborts is not None else 'USB write aborts: —']
+        return [f'Capture Queue Drops: {drops}', *fifos,
+                f'USB Write Aborts: {aborts:,}' if aborts is not None else 'USB Write Aborts: —']
 
     @staticmethod
     def _wrap_fields(fields, width):
@@ -370,7 +370,7 @@ class TerminalStatus:
         b0, b1 = self.rates
         capture = [f' DashKit USB · {self.state}']
         if self.log_offset:
-            capture.append('Log history · End to follow')
+            capture.append('Log History · End to Follow')
         if self.port:
             capture.append(self.port)
         receive = f'Total RX: {b0 + b1:,.0f} fps'
@@ -381,14 +381,14 @@ class TerminalStatus:
             capture.extend([receive, breakdown])
         capture.append(f'Total Frames: {sum(self.stream.frames):,}')
         if not self.log_offset:
-            capture.append('PgUp for log history')
+            capture.append('PgUp for Log History')
         return self._wrap_fields(capture, width)
 
     def _footer_lines(self, width):
         utilization = ['Utilization', *self._utilization_fields()]
-        counters = ['Capture counters', f'USB frame sequence gaps: {sum(self.stream.gaps):,}',
-                    *self._device_counter_fields(), f'Invalid USB records: {self.stream.invalid:,}',
-                    f'DashKit reboots: {self.stream.restarts:,}']
+        counters = ['Capture Counters', f'USB Frame Sequence Gaps: {sum(self.stream.gaps):,}',
+                    *self._device_counter_fields(), f'Invalid USB Records: {self.stream.invalid:,}',
+                    f'Device Reboots: {self.stream.restarts:,}']
         return self._wrap_fields(utilization, width) + self._wrap_fields(counters, width)
 
     def _draw(self):
@@ -513,10 +513,10 @@ class TerminalStatus:
             previous_aborts = self.device_aborts or 0
             new_aborts = max(0, stream.usb_aborts - previous_aborts)
             if new_aborts:
-                self.log(f'DashKit USB write aborts: +{new_aborts:,}.')
+                self.log(f'DashKit USB Write Aborts: +{new_aborts:,}.')
             self.device_aborts = stream.usb_aborts
         if not self.enabled and stream.utilization is not None and now - stream.utilization_time < 3.0:
-            self.log('Device metrics | ' + ' | '.join(self._utilization_fields() + self._device_counter_fields()))
+            self.log('Device Metrics | ' + ' | '.join(self._utilization_fields() + self._device_counter_fields()))
         self._draw()
 
     def close(self):
@@ -563,7 +563,7 @@ def run(args):
                     port = args.port or detect_port(list_ports.comports())
                     with serial.Serial(port, args.baud, timeout=0.1, write_timeout=0.1) as usb:
                         connected_once = True
-                        status.set_state('STREAMING', port)
+                        status.set_state('Streaming', port)
                         status.log(f'USB connected: {port}')
                         try:
                             while True:
@@ -586,7 +586,7 @@ def run(args):
                             raise
                 except (serial.SerialException, OSError) as error:
                     stream.reset_input()
-                    status.set_state('RECONNECTING' if connected_once else 'WAITING FOR USB')
+                    status.set_state('Reconnecting' if connected_once else 'Waiting for USB')
                     status.log(f'Serial unavailable ({error}). Retrying in two seconds.')
                     time.sleep(2)
         finally:

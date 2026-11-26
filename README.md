@@ -57,12 +57,12 @@ A port might appear as `/dev/cu.usbmodem101` on macOS or `COM3` on Windows. Make
 
 Firmware log lines appear with a `[FIRMWARE]` label. On color terminals, errors are red, warnings are yellow, and other firmware messages are cyan. The header shows the connection and CAN receive rates. The footer shows utilization and capture counters. A dash means a device metric is unavailable.
 
-- **USB frame sequence gaps** count missing CAN frame numbers in the stream received by the bridge.
-- **Capture queue drops** count received CAN frames the firmware discarded because its software capture queue was full.
-- **CAN controller FIFO A/B overflows** count hardware receive FIFO overflow events. Each event indicates at least one lost CAN frame.
-- **USB write aborts** count batches the firmware could not fully send over USB. Depending on the firmware, this can include batches dropped because the USB output queue was full.
-- **Invalid USB records** count records the bridge rejects, such as malformed records, CRC failures, or duplicate or out-of-order CAN frame numbers.
-- **DashKit reboots** count changes in the firmware boot ID observed by the bridge.
+- **USB Frame Sequence Gaps** count missing CAN frame numbers in the stream received by the bridge.
+- **Capture Queue Drops** count received CAN frames the firmware discarded because its software capture queue was full.
+- **CAN Controller FIFO A/B Overflows** count hardware receive FIFO overflow events. Each event indicates at least one lost CAN frame.
+- **USB Write Aborts** count batches the firmware could not fully send over USB. Depending on the firmware, this can include batches dropped because the USB output queue was full.
+- **Invalid USB Records** count records the bridge rejects, such as malformed records, CRC failures, or duplicate or out-of-order CAN frame numbers.
+- **Device Reboots** count changes in the firmware boot ID observed by the bridge.
 
 Use Page Up and Page Down to scroll the retained log, Home to jump to the oldest entries, and End to resume following live output. The bridge retains the latest 2,000 log lines while it runs.
 
