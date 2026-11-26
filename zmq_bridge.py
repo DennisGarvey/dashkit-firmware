@@ -426,8 +426,7 @@ class TerminalStatus:
                 self.screen.clrtoeol()
                 if width > 1:
                     self.screen.addnstr(row, 0, line, width - 1)
-                if row == 0:
-                    self.screen.chgat(0, 0, width, curses.A_BOLD | curses.A_REVERSE)
+                self.screen.chgat(row, 0, width, curses.A_BOLD | curses.A_REVERSE)
             self.screen.move(*cursor)
             self.screen.refresh()
             self.drawn_header = header
@@ -459,8 +458,8 @@ class TerminalStatus:
             columns = width - 1
             for row, line in enumerate(header):
                 if columns:
-                    self.screen.addnstr(row, 0, line, columns, curses.A_BOLD if row == 0 else 0)
-            self.screen.chgat(0, 0, width, curses.A_BOLD | curses.A_REVERSE)
+                    self.screen.addnstr(row, 0, line, columns)
+                self.screen.chgat(row, 0, width, curses.A_BOLD | curses.A_REVERSE)
             if width > 1:
                 sidebar_column = width - metrics_width - 2
                 self.log_columns = sidebar_column - 1 if sidebar else columns
