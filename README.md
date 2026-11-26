@@ -57,10 +57,19 @@ A port might appear as `/dev/cu.usbmodem101` on macOS or `COM3` on Windows. Make
 
 Firmware log lines appear with a `[FIRMWARE]` label. On color terminals, errors are red, warnings are yellow, and other firmware messages are cyan. The header shows the connection and CAN receive rates. Utilization and capture counters appear in a right-hand sidebar when the terminal has room, or in a footer on smaller terminals. A dash means a device metric is unavailable.
 
-- **USB Frame Sequence Gaps** count missing CAN frame numbers in the stream received by the bridge.
+### Device Counters (Since Boot)
+
+DashKit reports these counters. A DashKit reboot resets them. Reconnecting to the same device or restarting the bridge preserves the firmware totals.
+
 - **Capture Queue Drops** count received CAN frames the firmware discarded because its software capture queue was full.
 - **CAN Controller FIFO A/B Overflows** count hardware receive FIFO overflow events. Each event indicates at least one lost CAN frame.
 - **USB Write Aborts** count batches the firmware could not fully send over USB. Depending on the firmware, this can include batches dropped because the USB output queue was full.
+
+### Bridge Counters (Since Launch)
+
+The bridge counts these events until it exits. Reconnecting to DashKit preserves the totals.
+
+- **USB Frame Sequence Gaps** count missing CAN frame numbers in the stream received by the bridge.
 - **Invalid USB Records** count records the bridge rejects, such as malformed records, CRC failures, or duplicate or out-of-order CAN frame numbers.
 - **Device Reboots** count changes in the firmware boot ID observed by the bridge.
 

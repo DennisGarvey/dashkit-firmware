@@ -394,10 +394,15 @@ class TerminalStatus:
         capture.append(hint.ljust(len(history_hint)))
         return [line.rstrip() for line in self._wrap_fields(capture, width)]
 
-    def _capture_counter_fields(self):
-        return [f'USB Frame Sequence Gaps: {sum(self.stream.gaps):,}',
-                *self._device_counter_fields(), f'Invalid USB Records: {self.stream.invalid:,}',
-                f'Device Reboots: {self.stream.restarts:,}']
+    def _metric_groups(self):
+        return [
+            ['Utilization', *self._utilization_fields()],
+            ['Device Counters (Since Boot)', *self._device_counter_fields()],
+            ['Bridge Counters (Since Launch)',
+             f'USB Frame Sequence Gaps: {sum(self.stream.gaps):,}',
+             f'Invalid USB Records: {self.stream.invalid:,}',
+             f'Device Reboots: {self.stream.restarts:,}'],
+        ]
 
     def _draw(self):
         if not self.enabled:
@@ -408,15 +413,13 @@ class TerminalStatus:
                 return
             self.screen.erase()
             header = self._header_lines(width)[:max(1, (height - 1) // 3)]
-            utilization = self._utilization_fields()
-            counters = self._capture_counter_fields()
-            metrics_width = max(43, max(map(len, utilization + counters)) + 2)
-            side_rows = ['Utilization', *utilization, '', 'Capture Counters', *counters]
+            groups = self._metric_groups()
+            side_rows = [field for group in groups for field in (*group, '')][:-1]
+            metrics_width = max(43, max(map(len, side_rows)) + 2)
             sidebar = width - metrics_width >= 60 and height - len(header) >= len(side_rows)
             footer = []
             if not sidebar:
-                footer = self._wrap_fields(['Utilization', *utilization], width)
-                footer += self._wrap_fields(['Capture Counters', *counters], width)
+                footer = [line for group in groups for line in self._wrap_fields(group, width)]
                 footer = footer[:max(0, height - len(header) - 2)]
             footer_start = height - len(footer)
             divider = footer_start - bool(footer)
@@ -568,7 +571,8 @@ class TerminalStatus:
                 self.log(f'DashKit USB Write Aborts: +{new_aborts:,}.')
             self.device_aborts = stream.usb_aborts
         if not self.enabled and stream.utilization is not None and now - stream.utilization_time < 3.0:
-            self.log('Device Metrics | ' + ' | '.join(self._utilization_fields() + self._device_counter_fields()))
+            for group in self._metric_groups():
+                self.log(' | '.join(group))
         self._draw()
 
     def close(self):
