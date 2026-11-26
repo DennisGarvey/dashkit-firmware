@@ -442,6 +442,9 @@ class TerminalStatus:
                     self.screen.hline(divider, 0, curses.ACS_HLINE, columns)
                 for row, line in enumerate(footer, footer_start):
                     self.screen.addnstr(row, 0, line, columns)
+                if visible:
+                    last_line, _ = visible[-1]
+                    self.screen.move(len(header) + len(visible) - 1, min(len(last_line), log_columns))
             self.screen.refresh()
         except curses.error:
             # A resize can arrive during drawing; the next draw rebuilds it.
