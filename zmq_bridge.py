@@ -372,8 +372,13 @@ class TerminalStatus:
             capture.append('Log history · End to follow')
         if self.port:
             capture.append(self.port)
-        capture.extend([f'RX: {b0 + b1:,.0f} fps', f'Bus 0: {b0:,.0f} fps',
-                        f'Bus 1: {b1:,.0f} fps', f'Frames: {sum(self.stream.frames):,}'])
+        receive = f'Total RX: {b0 + b1:,.0f} fps'
+        breakdown = f'(Bus 0: {b0:,.0f} / Bus 1: {b1:,.0f} fps)'
+        if len(f'{receive} {breakdown}') < width:
+            capture.append(f'{receive} {breakdown}')
+        else:
+            capture.extend([receive, breakdown])
+        capture.append(f'Total Frames: {sum(self.stream.frames):,}')
         if not self.log_offset:
             capture.append('PgUp for log history')
         return self._wrap_fields(capture, width)
