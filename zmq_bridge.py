@@ -324,37 +324,41 @@ class TerminalStatus:
         if curses.is_term_resized(size.lines, size.columns):
             curses.resizeterm(size.lines, size.columns)
 
-    def _metric_fields(self):
+    def _utilization_fields(self):
         values = self.stream.utilization
         if values is None or time.monotonic() - self.stream.utilization_time >= 3.0:
-            utilization = [f'{label}: —' for label in UTILIZATION_LABELS]
-        else:
-            utilization = [f'{label}: {value / 10:.1f}%'
-                           for label, value in zip(UTILIZATION_LABELS, values)]
+            return [f'{label}: —' for label in UTILIZATION_LABELS]
+        return [f'{label}: {value / 10:.1f}%'
+                for label, value in zip(UTILIZATION_LABELS, values)]
+
+    def _device_counter_fields(self):
         status = self.stream.status
         drops = ' / '.join(f'B{bus} {values[0]:,}' if values is not None else f'B{bus} —'
                            for bus, values in enumerate(status))
         fifos = [f'FIFO {label}: {values[1]:,}' if values is not None else f'FIFO {label}: —'
                  for label, values in zip('AB', status)]
         aborts = self.stream.usb_aborts
-        return utilization + [f'Queue drops: {drops}', *fifos,
-                              f'USB aborts: {aborts:,}' if aborts is not None else 'USB aborts: —']
+        return [f'Capture drops: {drops}', *fifos,
+                f'USB aborts: {aborts:,}' if aborts is not None else 'USB aborts: —']
 
     def _status_lines(self, width):
         b0, b1 = self.rates
-        fields = [f'DashKit {self.state}', f'RX: {b0 + b1:,.0f} fps (B0 {b0:,.0f} / B1 {b1:,.0f})',
-                  *self._metric_fields(), f'Frames: {sum(self.stream.frames):,}',
-                  f'Gaps: {sum(self.stream.gaps):,}', f'Invalid: {self.stream.invalid:,}',
-                  f'Restarts: {self.stream.restarts:,}']
+        capture = [f'DashKit {self.state}']
         if self.port:
-            fields.append(self.port)
-        lines = [fields[0]]
-        for field in fields[1:]:
-            line = f'{lines[-1]} | {field}'
-            if len(line) < width:
-                lines[-1] = line
-            else:
-                lines.append(field)
+            capture.append(self.port)
+        capture.extend([f'RX: {b0 + b1:,.0f} fps', f'Bus 0: {b0:,.0f} fps',
+                        f'Bus 1: {b1:,.0f} fps', f'Frames: {sum(self.stream.frames):,}'])
+        counters = [f'USB seq gaps: {sum(self.stream.gaps):,}', *self._device_counter_fields(),
+                    f'Invalid USB: {self.stream.invalid:,}', f'Device restarts: {self.stream.restarts:,}']
+        lines = []
+        for fields in (capture, self._utilization_fields(), counters):
+            lines.append(fields[0])
+            for field in fields[1:]:
+                line = f'{lines[-1]} | {field}'
+                if len(line) < width:
+                    lines[-1] = line
+                else:
+                    lines.append(field)
         return lines
 
     def _draw(self):
@@ -466,7 +470,7 @@ class TerminalStatus:
                 self.log(f'Device USB aborts: +{new_aborts:,}.')
             self.device_aborts = stream.usb_aborts
         if not self.enabled and stream.utilization is not None and now - stream.utilization_time < 3.0:
-            self.log('Device metrics | ' + ' | '.join(self._metric_fields()))
+            self.log('Device metrics | ' + ' | '.join(self._utilization_fields() + self._device_counter_fields()))
         self._draw()
 
     def close(self):
