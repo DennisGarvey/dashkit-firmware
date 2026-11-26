@@ -348,11 +348,12 @@ class TerminalStatus:
         status = self.stream.status
         drops = ' / '.join(f'B{bus} {values[0]:,}' if values is not None else f'B{bus} —'
                            for bus, values in enumerate(status))
-        fifos = [f'FIFO {label}: {values[1]:,}' if values is not None else f'FIFO {label}: —'
+        fifos = [f'CAN controller FIFO {label} overflows: {values[1]:,}'
+                 if values is not None else f'CAN controller FIFO {label} overflows: —'
                  for label, values in zip('AB', status)]
         aborts = self.stream.usb_aborts
-        return [f'Capture drops: {drops}', *fifos,
-                f'USB aborts: {aborts:,}' if aborts is not None else 'USB aborts: —']
+        return [f'Capture queue drops: {drops}', *fifos,
+                f'USB write aborts: {aborts:,}' if aborts is not None else 'USB write aborts: —']
 
     @staticmethod
     def _wrap_fields(fields, width):
@@ -385,8 +386,9 @@ class TerminalStatus:
 
     def _footer_lines(self, width):
         utilization = ['Utilization', *self._utilization_fields()]
-        counters = ['Capture counters', f'USB seq gaps: {sum(self.stream.gaps):,}', *self._device_counter_fields(),
-                    f'Invalid USB: {self.stream.invalid:,}', f'Device restarts: {self.stream.restarts:,}']
+        counters = ['Capture counters', f'USB frame sequence gaps: {sum(self.stream.gaps):,}',
+                    *self._device_counter_fields(), f'Invalid USB records: {self.stream.invalid:,}',
+                    f'DashKit reboots: {self.stream.restarts:,}']
         return self._wrap_fields(utilization, width) + self._wrap_fields(counters, width)
 
     def _draw(self):
@@ -488,7 +490,7 @@ class TerminalStatus:
         self.last_update = now
 
         if new_restarts:
-            self.log(f'USB device restarted ({stream.restarts:,} total).')
+            self.log(f'DashKit reboot detected ({stream.restarts:,} total).')
         if sum(new_gaps) or new_invalid:
             self.log(f'CAN/USB warning: +{sum(new_gaps):,} sequence gaps '
                      f'(B0 +{new_gaps[0]:,}, B1 +{new_gaps[1]:,}), '
@@ -502,8 +504,8 @@ class TerminalStatus:
             increments = [max(0, new - old) for new, old in zip(current, previous)] \
                 if previous is not None else list(current)
             if any(increments):
-                self.log(f'Bus {bus} device drops: +{increments[0]:,} queue, '
-                         f'+{increments[1]:,} FIFO (since last report).')
+                self.log(f'Bus {bus}: +{increments[0]:,} capture queue drops, '
+                         f'+{increments[1]:,} CAN controller FIFO overflows.')
             self.device_drops[bus] = current
         if stream.usb_aborts is None:
             self.device_aborts = None
@@ -511,7 +513,7 @@ class TerminalStatus:
             previous_aborts = self.device_aborts or 0
             new_aborts = max(0, stream.usb_aborts - previous_aborts)
             if new_aborts:
-                self.log(f'Device USB aborts: +{new_aborts:,}.')
+                self.log(f'DashKit USB write aborts: +{new_aborts:,}.')
             self.device_aborts = stream.usb_aborts
         if not self.enabled and stream.utilization is not None and now - stream.utilization_time < 3.0:
             self.log('Device metrics | ' + ' | '.join(self._utilization_fields() + self._device_counter_fields()))
