@@ -410,7 +410,9 @@ class TerminalStatus:
                 footer = footer[:max(0, height - len(header) - 2)]
             footer_start = height - len(footer)
             divider = footer_start - bool(footer)
-            self.log_rows = max(1, divider - len(header))
+            pane_rows = divider - len(header)
+            log_space = pane_rows - (pane_rows > 1)
+            self.log_rows = max(1, log_space)
             columns = width - 1
             for row, line in enumerate(header):
                 if columns:
@@ -420,7 +422,6 @@ class TerminalStatus:
                 sidebar_column = width - metrics_width - 2
                 self.log_columns = sidebar_column - 1 if sidebar else columns
                 log_columns = self.log_columns
-                log_space = divider - len(header)
                 wrapped = [(line[start:start + log_columns], style) for line, style in self.logs
                            for start in range(0, max(1, len(line)), log_columns)]
                 self.max_log_offset = max(0, len(wrapped) - self.log_rows)
@@ -442,9 +443,12 @@ class TerminalStatus:
                     self.screen.hline(divider, 0, curses.ACS_HLINE, columns)
                 for row, line in enumerate(footer, footer_start):
                     self.screen.addnstr(row, 0, line, columns)
-                if visible:
+                next_log_row = len(header) + len(visible)
+                if next_log_row < divider:
+                    self.screen.move(next_log_row, 0)
+                elif visible:
                     last_line, _ = visible[-1]
-                    self.screen.move(len(header) + len(visible) - 1, min(len(last_line), log_columns))
+                    self.screen.move(next_log_row - 1, len(last_line))
             self.screen.refresh()
         except curses.error:
             # A resize can arrive during drawing; the next draw rebuilds it.
