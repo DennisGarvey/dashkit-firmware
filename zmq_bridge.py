@@ -276,6 +276,8 @@ class TerminalStatus:
         self.log_rows = 1
         self.log_columns = 1
         self.screen = None
+        self.drawn_size = None
+        self.drawn_header = []
         self.firmware_colors = {}
         self.enabled = bool(enabled and curses is not None
                             and sys.stdin.isatty() and sys.stdout.isatty()
@@ -404,6 +406,34 @@ class TerminalStatus:
              f'Device Reboots: {self.stream.restarts:,}'],
         ]
 
+    def _visible_header(self, height, width):
+        return self._header_lines(width)[:max(1, (height - 1) // 3)]
+
+    def _draw_frame_header(self):
+        try:
+            height, width = self.screen.getmaxyx()
+            header = self._visible_header(height, width)
+            if (height, width) != self.drawn_size or len(header) != len(self.drawn_header):
+                self._draw()
+                return
+            if header == self.drawn_header:
+                return
+            cursor = self.screen.getyx()
+            for row, (old, line) in enumerate(zip(self.drawn_header, header)):
+                if line == old:
+                    continue
+                self.screen.move(row, 0)
+                self.screen.clrtoeol()
+                if width > 1:
+                    self.screen.addnstr(row, 0, line, width - 1)
+                if row == 0:
+                    self.screen.chgat(0, 0, width, curses.A_BOLD | curses.A_REVERSE)
+            self.screen.move(*cursor)
+            self.screen.refresh()
+            self.drawn_header = header
+        except curses.error:
+            self.drawn_size = None
+
     def _draw(self):
         if not self.enabled:
             return
@@ -412,7 +442,7 @@ class TerminalStatus:
             if height < 1 or width < 1:
                 return
             self.screen.erase()
-            header = self._header_lines(width)[:max(1, (height - 1) // 3)]
+            header = self._visible_header(height, width)
             groups = self._metric_groups()
             side_rows = [field for group in groups for field in (*group, '')][:-1]
             metrics_width = max(43, max(map(len, side_rows)) + 2)
@@ -474,9 +504,11 @@ class TerminalStatus:
                     last_line, _ = visible[-1]
                     self.screen.move(next_log_row - 1, len(last_line))
             self.screen.refresh()
+            self.drawn_size = height, width
+            self.drawn_header = header
         except curses.error:
             # A resize can arrive during drawing; the next draw rebuilds it.
-            pass
+            self.drawn_size = None
 
     def log(self, message, redraw=True, style=0):
         lines = str(message).split('\n')
@@ -522,15 +554,18 @@ class TerminalStatus:
             redraw = False
         now = time.monotonic()
         stream = self.stream
-        if self.enabled and now - self.last_frame_refresh >= 0.2:
+        frame_changed = False
+        if self.enabled and now - self.last_frame_refresh >= 0.05:
             self.last_frame_refresh = now
             total_frames = sum(stream.frames)
-            redraw = redraw or total_frames != self.total_frames
+            frame_changed = total_frames != self.total_frames
             self.total_frames = total_frames
         elapsed = now - self.last_update
         if elapsed < 1.0:
             if redraw:
                 self._draw()
+            elif frame_changed:
+                self._draw_frame_header()
             return
         self.rates = [(count - previous) / elapsed
                       for count, previous in zip(stream.frames, self.frames)]
