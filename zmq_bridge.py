@@ -384,12 +384,10 @@ class TerminalStatus:
             capture.append('PgUp for Log History')
         return self._wrap_fields(capture, width)
 
-    def _footer_lines(self, width):
-        utilization = ['Utilization', *self._utilization_fields()]
-        counters = ['Capture Counters', f'USB Frame Sequence Gaps: {sum(self.stream.gaps):,}',
-                    *self._device_counter_fields(), f'Invalid USB Records: {self.stream.invalid:,}',
-                    f'Device Reboots: {self.stream.restarts:,}']
-        return self._wrap_fields(utilization, width) + self._wrap_fields(counters, width)
+    def _capture_counter_fields(self):
+        return [f'USB Frame Sequence Gaps: {sum(self.stream.gaps):,}',
+                *self._device_counter_fields(), f'Invalid USB Records: {self.stream.invalid:,}',
+                f'Device Reboots: {self.stream.restarts:,}']
 
     def _draw(self):
         if not self.enabled:
@@ -400,7 +398,16 @@ class TerminalStatus:
                 return
             self.screen.erase()
             header = self._header_lines(width)[:max(1, (height - 1) // 3)]
-            footer = self._footer_lines(width)[:max(0, height - len(header) - 2)]
+            utilization = self._utilization_fields()
+            counters = self._capture_counter_fields()
+            metrics_width = max(43, max(map(len, utilization + counters)) + 2)
+            side_rows = ['Utilization', *utilization, '', 'Capture Counters', *counters]
+            sidebar = width - metrics_width >= 60 and height - len(header) >= len(side_rows)
+            footer = []
+            if not sidebar:
+                footer = self._wrap_fields(['Utilization', *utilization], width)
+                footer += self._wrap_fields(['Capture Counters', *counters], width)
+                footer = footer[:max(0, height - len(header) - 2)]
             footer_start = height - len(footer)
             divider = footer_start - bool(footer)
             self.log_rows = max(1, divider - len(header))
@@ -410,16 +417,27 @@ class TerminalStatus:
                     self.screen.addnstr(row, 0, line, columns, curses.A_BOLD if row == 0 else 0)
             self.screen.chgat(0, 0, width, curses.A_BOLD | curses.A_REVERSE)
             if width > 1:
-                self.log_columns = columns
+                sidebar_column = width - metrics_width - 2
+                self.log_columns = sidebar_column - 1 if sidebar else columns
+                log_columns = self.log_columns
                 log_space = divider - len(header)
-                wrapped = [(line[start:start + columns], style) for line, style in self.logs
-                           for start in range(0, max(1, len(line)), columns)]
+                wrapped = [(line[start:start + log_columns], style) for line, style in self.logs
+                           for start in range(0, max(1, len(line)), log_columns)]
                 self.max_log_offset = max(0, len(wrapped) - self.log_rows)
                 self.log_offset = min(self.log_offset, self.max_log_offset)
                 end = len(wrapped) - self.log_offset
                 visible = wrapped[max(0, end - log_space):end]
                 for row, (line, style) in enumerate(visible, len(header)):
-                    self.screen.addnstr(row, 0, line, columns, style)
+                    self.screen.addnstr(row, 0, line, log_columns, style)
+                if sidebar:
+                    self.screen.vline(len(header), sidebar_column, curses.ACS_VLINE, log_space)
+                    for row, field in enumerate(side_rows, len(header)):
+                        label, separator, value = field.partition(': ')
+                        if separator:
+                            line = f'{label}{value:>{metrics_width - len(label) - 1}}'
+                            self.screen.addnstr(row, sidebar_column + 2, line, metrics_width - 1)
+                        elif field:
+                            self.screen.addnstr(row, sidebar_column + 2, field, metrics_width, curses.A_BOLD)
                 if footer:
                     self.screen.hline(divider, 0, curses.ACS_HLINE, columns)
                 for row, line in enumerate(footer, footer_start):

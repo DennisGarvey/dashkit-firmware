@@ -55,7 +55,7 @@ A port might appear as `/dev/cu.usbmodem101` on macOS or `COM3` on Windows. Make
 
 ## Read the bridge output
 
-Firmware log lines appear with a `[FIRMWARE]` label. On color terminals, errors are red, warnings are yellow, and other firmware messages are cyan. The header shows the connection and CAN receive rates. The footer shows utilization and capture counters. A dash means a device metric is unavailable.
+Firmware log lines appear with a `[FIRMWARE]` label. On color terminals, errors are red, warnings are yellow, and other firmware messages are cyan. The header shows the connection and CAN receive rates. Utilization and capture counters appear in a right-hand sidebar when the terminal has room, or in a footer on smaller terminals. A dash means a device metric is unavailable.
 
 - **USB Frame Sequence Gaps** count missing CAN frame numbers in the stream received by the bridge.
 - **Capture Queue Drops** count received CAN frames the firmware discarded because its software capture queue was full.
