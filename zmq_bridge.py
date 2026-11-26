@@ -377,8 +377,6 @@ class TerminalStatus:
     def _header_lines(self, width):
         b0, b1 = self.rates
         capture = [f' DashKit USB · {self.state}']
-        if self.log_cursor >= 0:
-            capture.append('Log History · End to Follow')
         if self.port:
             capture.append(self.port)
         receive = f'Total RX: {b0 + b1:,.0f} fps'
@@ -388,9 +386,11 @@ class TerminalStatus:
         else:
             capture.extend([receive, breakdown])
         capture.append(f'Total Frames: {sum(self.stream.frames):,}')
-        if self.log_cursor < 0:
-            capture.append('↑ for Log History')
-        return self._wrap_fields(capture, width)
+        live_hint = '↑ for Log History'
+        history_hint = 'Log History · End to Follow'
+        hint = history_hint if self.log_cursor >= 0 else live_hint
+        capture.append(hint.ljust(len(history_hint)))
+        return [line.rstrip() for line in self._wrap_fields(capture, width)]
 
     def _capture_counter_fields(self):
         return [f'USB Frame Sequence Gaps: {sum(self.stream.gaps):,}',
