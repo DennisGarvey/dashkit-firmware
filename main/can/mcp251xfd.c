@@ -1,4 +1,7 @@
 #include "mcp251xfd.h"
+#ifdef CONFIG_DASHKIT_USB_STREAM
+#include "usb_capture.h"
+#endif
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -206,7 +209,11 @@ static esp_err_t stream_xfer(void *io, const uint8_t *tx, uint8_t *rx, size_t le
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    return spi_device_polling_transmit(ctx->spi_dev, &t);
+    esp_err_t err = spi_device_polling_transmit(ctx->spi_dev, &t);
+#ifdef CONFIG_DASHKIT_USB_STREAM
+    if (err == ESP_OK) usb_capture_account_spi(ctx->bus_id, t.length);
+#endif
+    return err;
 }
 
 static void stream_lock(void *arg)
@@ -377,6 +384,9 @@ static void overflow_report_cb(void *arg)
         ov += now.rx_overflow[i];
         ov_was += was->rx_overflow[i];
     }
+#ifdef CONFIG_DASHKIT_USB_STREAM
+    usb_capture_account_overflows(ctx->bus_id, ov - ov_was);
+#endif
     uint32_t secs = (uint32_t)(RX_OVERFLOW_REPORT_US / 1000000);
     uint32_t step_max = ctx->step_max_us, gap_max = ctx->busy_gap_max_us;
     ctx->step_max_us = 0;

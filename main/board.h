@@ -1,5 +1,7 @@
 #pragma once
 
+#define CAN_NOMINAL_BITRATE 500000u
+
 // --- SPI: CAN Interface 0 (MCP2518FDT) ---
 #define CAN0_SPI_HOST       SPI2_HOST
 #define CAN0_PIN_MOSI       GPIO_NUM_11

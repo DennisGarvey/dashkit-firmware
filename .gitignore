@@ -7,3 +7,6 @@ dependencies.lock
 .idea/
 .cache
 CLAUDE.md
+build-ble-usb/
+sdkconfig.ble-usb.generated
+sdkconfig.ble-usb.generated.old

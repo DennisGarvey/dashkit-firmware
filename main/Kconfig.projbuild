@@ -38,4 +38,13 @@ menu "DashKit"
             AA:BB:CC:DD:EE:FF seen"). BTHome advertisements are unauthenticated,
             so events from any other device are ignored. Empty: no button
             triggers anything; nearby devices are only logged.
+    config DASHKIT_USB_STREAM
+        bool "Read-only CAN streaming over native USB"
+        default n
+        depends on ESP_CONSOLE_NONE && ESP_CONSOLE_SECONDARY_NONE && FREERTOS_GENERATE_RUN_TIME_STATS
+        help
+            Stream received CAN frames over USB alongside the native DashKit
+            features. USB accepts capture session requests only. The CAN
+            controller mode and native transmit paths are unchanged.
+
 endmenu

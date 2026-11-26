@@ -183,7 +183,7 @@ void app_main(void)
         .pin_int      = CAN0_PIN_INT,
         .spi_clock_hz = CAN0_SPI_CLOCK_HZ,
         .osc_freq_hz  = CAN0_OSC_FREQ_HZ,
-        .bitrate      = 500000,
+        .bitrate      = CAN_NOMINAL_BITRATE,
         .bitrate_data = 0,
         .bus_id       = 0,
     };
@@ -205,7 +205,7 @@ void app_main(void)
         .pin_int      = CAN1_PIN_INT,
         .spi_clock_hz = CAN1_SPI_CLOCK_HZ,
         .osc_freq_hz  = CAN1_OSC_FREQ_HZ,
-        .bitrate      = 500000,
+        .bitrate      = CAN_NOMINAL_BITRATE,
         .bitrate_data = 0,
         .bus_id       = 1,
     };

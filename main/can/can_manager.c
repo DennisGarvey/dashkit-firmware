@@ -1,5 +1,8 @@
 #include "can_manager.h"
 #include "can_filter.h"
+#ifdef CONFIG_DASHKIT_USB_STREAM
+#include "usb_capture.h"
+#endif
 #include "automation_manager.h"
 #include "vehicle_control.h"
 #include "dbc.h"
@@ -24,6 +27,9 @@ static QueueHandle_t    s_rx_queue = NULL;
 static void on_frame_received(const can_tagged_frame_t *frame, void *user_ctx)
 {
     (void)user_ctx;
+#ifdef CONFIG_DASHKIT_USB_STREAM
+    usb_capture_submit(frame);
+#endif
     if (!s_rx_queue) return;
     // The controllers deliver every frame on the bus. The firmware's own work is only for the ids in
     // dbc/used_messages.txt, the same frames the hardware filters let through before; the rest of the bus
@@ -54,6 +60,14 @@ esp_err_t can_manager_init(void)
     if (!s_rx_queue) {
         return ESP_ERR_NO_MEM;
     }
+#ifdef CONFIG_DASHKIT_USB_STREAM
+    esp_err_t err = usb_capture_init();
+    if (err != ESP_OK) {
+        vQueueDelete(s_rx_queue);
+        s_rx_queue = NULL;
+        return err;
+    }
+#endif
     s_iface_count = 0;
     ESP_LOGI(TAG, "CAN manager initialized (queue depth=%d)", RX_QUEUE_DEPTH);
     return ESP_OK;
