@@ -55,6 +55,8 @@ A port might appear as `/dev/cu.usbmodem101` on macOS or `COM3` on Windows. Make
 
 ## Read the bridge output
 
-Firmware log lines appear in the scrolling output with a `[FIRMWARE]` label. On color terminals, errors are red, warnings are yellow, and other firmware messages are cyan. The status bar groups connection and receive rates, utilization, and capture counters on separate rows. Its counter labels match Cabana, including **USB seq gaps**, **Capture drops**, **FIFO A**, **FIFO B**, and **Invalid USB**. A dash means a device metric is unavailable.
+Firmware log lines appear with a `[FIRMWARE]` label. On color terminals, errors are red, warnings are yellow, and other firmware messages are cyan. The header shows the connection and CAN receive rates. The footer shows utilization and capture counters using Cabana labels such as **USB seq gaps**, **Capture drops**, **FIFO A**, **FIFO B**, and **Invalid USB**. A dash means a device metric is unavailable.
+
+Use Page Up and Page Down to scroll the retained log, Home to jump to the oldest entries, and End to resume following live output. The bridge retains the latest 2,000 log lines while it runs.
 
 Use `--no-status` for plain-text logs and metrics when redirecting output or using a terminal without curses. Run `python zmq_bridge.py --help` to see all options.

@@ -269,6 +269,10 @@ class TerminalStatus:
         self.state = 'WAITING FOR USB'
         self.port = None
         self.logs = deque(maxlen=2000)
+        self.log_offset = 0
+        self.log_rows = 1
+        self.log_columns = 1
+        self.max_log_offset = 0
         self.screen = None
         self.firmware_colors = {}
         self.enabled = bool(enabled and curses is not None
@@ -311,18 +315,27 @@ class TerminalStatus:
             except curses.error:
                 self.firmware_colors.clear()
 
-    def _check_resize(self):
+    def _poll_terminal(self):
+        offset = self.log_offset
+        while (key := self.screen.getch()) != -1:
+            if key == curses.KEY_PPAGE:
+                self.log_offset += self.log_rows
+            elif key == curses.KEY_NPAGE:
+                self.log_offset -= self.log_rows
+            elif key == curses.KEY_HOME:
+                self.log_offset = self.max_log_offset
+            elif key == curses.KEY_END:
+                self.log_offset = 0
+            self.log_offset = min(max(0, self.log_offset), self.max_log_offset)
+        changed = offset != self.log_offset
         try:
             size = os.get_terminal_size(sys.stdout.fileno())
         except OSError:
-            return
-        if size.lines < 1 or size.columns < 1:
-            return
-        # Consume pending KEY_RESIZE events so curses updates its dimensions.
-        while self.screen.getch() != -1:
-            pass
-        if curses.is_term_resized(size.lines, size.columns):
+            return changed
+        if size.lines > 0 and size.columns > 0 and curses.is_term_resized(size.lines, size.columns):
             curses.resizeterm(size.lines, size.columns)
+            return True
+        return changed
 
     def _utilization_fields(self):
         values = self.stream.utilization
@@ -341,53 +354,69 @@ class TerminalStatus:
         return [f'Capture drops: {drops}', *fifos,
                 f'USB aborts: {aborts:,}' if aborts is not None else 'USB aborts: —']
 
-    def _status_lines(self, width):
+    @staticmethod
+    def _wrap_fields(fields, width):
+        lines = [fields[0]]
+        for field in fields[1:]:
+            line = f'{lines[-1]}  |  {field}'
+            if len(line) < width:
+                lines[-1] = line
+            else:
+                lines.append(field)
+        return lines
+
+    def _header_lines(self, width):
         b0, b1 = self.rates
-        capture = [f'DashKit {self.state}']
+        capture = [f' DashKit USB · {self.state}']
+        if self.log_offset:
+            capture.append('Log history · End to follow')
         if self.port:
             capture.append(self.port)
         capture.extend([f'RX: {b0 + b1:,.0f} fps', f'Bus 0: {b0:,.0f} fps',
                         f'Bus 1: {b1:,.0f} fps', f'Frames: {sum(self.stream.frames):,}'])
-        counters = [f'USB seq gaps: {sum(self.stream.gaps):,}', *self._device_counter_fields(),
+        if not self.log_offset:
+            capture.append('PgUp for log history')
+        return self._wrap_fields(capture, width)
+
+    def _footer_lines(self, width):
+        utilization = ['Utilization', *self._utilization_fields()]
+        counters = ['Capture counters', f'USB seq gaps: {sum(self.stream.gaps):,}', *self._device_counter_fields(),
                     f'Invalid USB: {self.stream.invalid:,}', f'Device restarts: {self.stream.restarts:,}']
-        lines = []
-        for fields in (capture, self._utilization_fields(), counters):
-            lines.append(fields[0])
-            for field in fields[1:]:
-                line = f'{lines[-1]} | {field}'
-                if len(line) < width:
-                    lines[-1] = line
-                else:
-                    lines.append(field)
-        return lines
+        return self._wrap_fields(utilization, width) + self._wrap_fields(counters, width)
 
     def _draw(self):
         if not self.enabled:
             return
         try:
-            self._check_resize()
             height, width = self.screen.getmaxyx()
             if height < 1 or width < 1:
                 return
             self.screen.erase()
-            status_lines = self._status_lines(width)[:max(1, height - 1)]
-            first_status_row = height - len(status_lines)
+            header = self._header_lines(width)[:max(1, (height - 1) // 3)]
+            footer = self._footer_lines(width)[:max(0, height - len(header) - 2)]
+            footer_start = height - len(footer)
+            divider = footer_start - bool(footer)
+            self.log_rows = max(1, divider - len(header))
+            columns = width - 1
+            for row, line in enumerate(header):
+                if columns:
+                    self.screen.addnstr(row, 0, line, columns, curses.A_BOLD if row == 0 else 0)
+            self.screen.chgat(0, 0, width, curses.A_BOLD | curses.A_REVERSE)
             if width > 1:
-                visible = deque()
-                columns = width - 1
-                for line, style in reversed(self.logs):
-                    if len(visible) >= first_status_row:
-                        break
-                    wrapped = [line[start:start + columns] for start in range(0, len(line), columns)]
-                    visible.extendleft((part, style) for part in reversed(wrapped or ['']))
-                while len(visible) > first_status_row:
-                    visible.popleft()
-                for row, (line, style) in enumerate(visible):
+                self.log_columns = columns
+                log_space = divider - len(header)
+                wrapped = [(line[start:start + columns], style) for line, style in self.logs
+                           for start in range(0, max(1, len(line)), columns)]
+                self.max_log_offset = max(0, len(wrapped) - self.log_rows)
+                self.log_offset = min(self.log_offset, self.max_log_offset)
+                end = len(wrapped) - self.log_offset
+                visible = wrapped[max(0, end - log_space):end]
+                for row, (line, style) in enumerate(visible, len(header)):
                     self.screen.addnstr(row, 0, line, columns, style)
-            for row, line in enumerate(status_lines, first_status_row):
-                if width > 1:
-                    self.screen.addnstr(row, 0, line, width - 1)
-                self.screen.chgat(row, 0, width, curses.A_REVERSE)
+                if footer:
+                    self.screen.hline(divider, 0, curses.ACS_HLINE, columns)
+                for row, line in enumerate(footer, footer_start):
+                    self.screen.addnstr(row, 0, line, columns)
             self.screen.refresh()
         except curses.error:
             # A resize can arrive during drawing; the next draw rebuilds it.
@@ -399,7 +428,11 @@ class TerminalStatus:
             print('\n'.join(lines), flush=True)
             return
         timestamp = time.strftime('%H:%M:%S')
-        self.logs.extend((f'[{timestamp}] {line}' if line else '', style) for line in lines)
+        lines = [f'[{timestamp}] {line}' if line else '' for line in lines]
+        self.logs.extend((line, style) for line in lines)
+        if self.log_offset:
+            self.log_offset += sum(max(1, (len(line) + self.log_columns - 1) // self.log_columns)
+                                   for line in lines)
         if redraw:
             self._draw()
 
@@ -426,9 +459,15 @@ class TerminalStatus:
         self._draw()
 
     def update(self):
+        try:
+            redraw = self.enabled and self._poll_terminal()
+        except curses.error:
+            redraw = False
         now = time.monotonic()
         elapsed = now - self.last_update
         if elapsed < 1.0:
+            if redraw:
+                self._draw()
             return
         stream = self.stream
         self.rates = [(count - previous) / elapsed
