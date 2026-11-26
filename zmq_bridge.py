@@ -281,6 +281,8 @@ class TerminalStatus:
                             and sys.stdin.isatty() and sys.stdout.isatty()
                             and os.environ.get('TERM', 'dumb') != 'dumb')
         self.last_update = time.monotonic()
+        self.last_frame_refresh = self.last_update
+        self.total_frames = sum(stream.frames)
         self.frames = stream.frames.copy()
         self.rates = [0.0, 0.0]
         self.gaps = stream.gaps.copy()
@@ -385,7 +387,7 @@ class TerminalStatus:
             capture.append(f'{receive} {breakdown}')
         else:
             capture.extend([receive, breakdown])
-        capture.append(f'Total Frames: {sum(self.stream.frames):,}')
+        capture.append(f'Total Frames: {self.total_frames:,}')
         live_hint = '↑ for Log History'
         history_hint = 'Log History · End to Follow'
         hint = history_hint if self.log_cursor >= 0 else live_hint
@@ -516,12 +518,17 @@ class TerminalStatus:
         except curses.error:
             redraw = False
         now = time.monotonic()
+        stream = self.stream
+        if self.enabled and now - self.last_frame_refresh >= 0.2:
+            self.last_frame_refresh = now
+            total_frames = sum(stream.frames)
+            redraw = redraw or total_frames != self.total_frames
+            self.total_frames = total_frames
         elapsed = now - self.last_update
         if elapsed < 1.0:
             if redraw:
                 self._draw()
             return
-        stream = self.stream
         self.rates = [(count - previous) / elapsed
                       for count, previous in zip(stream.frames, self.frames)]
         new_gaps = [count - previous
