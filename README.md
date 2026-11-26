@@ -55,6 +55,6 @@ A port might appear as `/dev/cu.usbmodem101` on macOS or `COM3` on Windows. Make
 
 ## Read the bridge output
 
-Firmware log lines appear in the scrolling output. The status bar shows CAN receive rates, USB serial utilization, CPU0 and CPU1 utilization, SPI utilization, CAN0 and CAN1 utilization, capture queue drops, FIFO overflows, and USB write aborts. It also shows the bridge's frame, gap, invalid-record, and restart counts. A dash means a device metric is unavailable.
+Firmware log lines appear in the scrolling output with a `[FIRMWARE]` label. On color terminals, errors are red, warnings are yellow, and other firmware messages are cyan. The status bar shows CAN receive rates, USB serial utilization, CPU0 and CPU1 utilization, SPI utilization, CAN0 and CAN1 utilization, capture queue drops, FIFO overflows, and USB write aborts. It also shows the bridge's frame, gap, invalid-record, and restart counts. A dash means a device metric is unavailable.
 
 Use `--no-status` for plain-text logs and metrics when redirecting output or using a terminal without curses. Run `python zmq_bridge.py --help` to see all options.

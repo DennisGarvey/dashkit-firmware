@@ -270,6 +270,7 @@ class TerminalStatus:
         self.port = None
         self.logs = deque(maxlen=2000)
         self.screen = None
+        self.firmware_colors = {}
         self.enabled = bool(enabled and curses is not None
                             and sys.stdin.isatty() and sys.stdout.isatty()
                             and os.environ.get('TERM', 'dumb') != 'dumb')
@@ -298,6 +299,17 @@ class TerminalStatus:
                         pass
                 self.screen = None
                 self.enabled = False
+
+        if self.enabled and curses.has_colors():
+            try:
+                curses.start_color()
+                curses.use_default_colors()
+                for pair, (level, color) in enumerate(
+                        (('I', curses.COLOR_CYAN), ('W', curses.COLOR_YELLOW), ('E', curses.COLOR_RED)), 1):
+                    curses.init_pair(pair, color, -1)
+                    self.firmware_colors[level] = curses.color_pair(pair)
+            except curses.error:
+                self.firmware_colors.clear()
 
     def _check_resize(self):
         try:
@@ -359,15 +371,15 @@ class TerminalStatus:
             if width > 1:
                 visible = deque()
                 columns = width - 1
-                for line in reversed(self.logs):
+                for line, style in reversed(self.logs):
                     if len(visible) >= first_status_row:
                         break
                     wrapped = [line[start:start + columns] for start in range(0, len(line), columns)]
-                    visible.extendleft(reversed(wrapped or ['']))
+                    visible.extendleft((part, style) for part in reversed(wrapped or ['']))
                 while len(visible) > first_status_row:
                     visible.popleft()
-                for row, line in enumerate(visible):
-                    self.screen.addnstr(row, 0, line, columns)
+                for row, (line, style) in enumerate(visible):
+                    self.screen.addnstr(row, 0, line, columns, style)
             for row, line in enumerate(status_lines, first_status_row):
                 if width > 1:
                     self.screen.addnstr(row, 0, line, width - 1)
@@ -377,13 +389,13 @@ class TerminalStatus:
             # A resize can arrive during drawing; the next draw rebuilds it.
             pass
 
-    def log(self, message, redraw=True):
+    def log(self, message, redraw=True, style=0):
         lines = str(message).split('\n')
         if not self.enabled:
             print('\n'.join(lines), flush=True)
             return
         timestamp = time.strftime('%H:%M:%S')
-        self.logs.extend(f'[{timestamp}] {line}' if line else '' for line in lines)
+        self.logs.extend((f'[{timestamp}] {line}' if line else '', style) for line in lines)
         if redraw:
             self._draw()
 
@@ -391,8 +403,13 @@ class TerminalStatus:
         message = ANSI_CSI.sub('', message).replace('\r\n', '\n').rstrip('\n')
         message = ''.join(char for char in message.replace('\t', '    ')
                           if char == '\n' or char.isprintable())
+        level = 'I'
         for line in message.splitlines():
-            self.log(f'Firmware | {line}', redraw=False)
+            severity = re.match(r'^([EWIDV]) +\(', line)
+            if severity:
+                level = severity[1]
+            style = self.firmware_colors.get(level, self.firmware_colors.get('I', 0))
+            self.log(f'[FIRMWARE] {line}', redraw=False, style=style)
 
     def set_state(self, state, port=None):
         if state != self.state:
