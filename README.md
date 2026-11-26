@@ -5,8 +5,18 @@ Run `zmq_bridge.py` on the machine connected to DashKit over USB. It publishes r
 ## Requirements
 
 - Python 3 with `pyserial`, `pycapnp`, and `pyzmq`.
-- A DashKit device running firmware that supports the Custom USB Serial v1 capture protocol. Firmware must emit log and utilization records for those diagnostics to appear.
+- A DashKit device running one of the USB capture builds below.
 - Cabana with ZMQ support.
+
+## Compatible firmware
+
+These firmware branches support Custom USB Serial v1. Use the branch's capture-enabled build configuration.
+
+- **`usb-rx-stock-featureset`** streams CAN frames, utilization, and firmware logs while keeping the standard DashKit features. Use the `sdkconfig.ble-usb` profile. [Firmware branch](https://github.com/DennisGarvey/dashkit-firmware/tree/usb-rx-stock-featureset)
+- **`usb-rx-only`** streams CAN frames and utilization in listen-only mode. Use the `sdkconfig.capture` profile. [Firmware branch](https://github.com/DennisGarvey/dashkit-firmware/tree/usb-rx-only)
+- **`usb-tx`** also streams CAN frames and utilization. Its `sdkconfig.capture` profile works with the bridge, which forwards received frames only. [Firmware branch](https://github.com/DennisGarvey/dashkit-firmware/tree/usb-tx)
+
+The `usb-rx-stock-featureset` build is the one that sends firmware logs. The standard `main` build does not include this USB capture protocol.
 
 ## Run on one machine
 
