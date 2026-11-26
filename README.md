@@ -10,7 +10,7 @@ Run `zmq_bridge.py` on the machine connected to DashKit over USB. It publishes r
 
 ## Compatible firmware
 
-These firmware branches support Custom USB Serial v1. Use the branch's capture-enabled build configuration.
+These firmware branches support [Custom USB Serial v1](PROTOCOL.md). Use the branch's capture-enabled build configuration.
 
 - **`usb-rx-stock-featureset`** streams CAN frames, utilization, and firmware logs while keeping the standard DashKit features. Use the `sdkconfig.ble-usb` profile. [Firmware branch](https://github.com/DennisGarvey/dashkit-firmware/tree/usb-rx-stock-featureset)
 - **`usb-rx-only`** streams CAN frames and utilization in listen-only mode. Use the `sdkconfig.capture` profile. [Firmware branch](https://github.com/DennisGarvey/dashkit-firmware/tree/usb-rx-only)
