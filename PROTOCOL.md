@@ -55,7 +55,9 @@ after the length field. Ignore those bytes when RTR is set.
 The device increments a separate 32-bit counter per bus before queueing
 each received frame for capture. The first numbered frame after boot on
 each bus has sequence 1, and the counter wraps modulo 2³². The timestamp
-is taken when the firmware submits the frame to the capture queue. The
+is expressed in device-uptime microseconds. Firmware can use the
+controller receive time or the software capture time. Frame timestamps may
+arrive out of order even when sequence numbers are contiguous. The
 local stock-feature USB build emits up to eight payload bytes per frame and
 leaves the RTR flag clear. Hosts should accept the full v1 format above.
 

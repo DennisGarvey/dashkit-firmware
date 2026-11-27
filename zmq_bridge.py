@@ -14,6 +14,7 @@ and pass the device path (for example /dev/ttyACM0, /dev/cu.usbmodem101 or COM3)
 """
 import argparse
 from collections import deque
+from heapq import heappop, heappush
 try:
     import curses
 except ImportError:
@@ -150,6 +151,37 @@ def decode(wire):
     return kind, bus, boot, sequence, timestamp, (address, b'' if rtr else bytes(raw[25:-2]))
 
 
+REORDER_NS = 3_000_000
+
+
+class FrameReorder:
+    def __init__(self):
+        self.pending = []
+        self.order = 0
+        self.newest_ns = 0
+        self.last_ns = 0
+        self.last_source_ns = 0
+        self.late = 0
+
+    def push(self, frame, now_ns):
+        timestamp, *_ = frame
+        self.newest_ns = max(self.newest_ns, timestamp)
+        heappush(self.pending, (timestamp, self.order, now_ns + REORDER_NS, frame))
+        self.order += 1
+
+    def ready(self, now_ns, flush=False):
+        while self.pending:
+            timestamp, _, deadline, frame = self.pending[0]
+            if not flush and now_ns < deadline and self.newest_ns - timestamp < REORDER_NS:
+                break
+            heappop(self.pending)
+            if timestamp < self.last_source_ns:
+                self.late += 1
+            self.last_source_ns = max(self.last_source_ns, timestamp)
+            self.last_ns = max(timestamp, self.last_ns + 1)
+            yield self.last_ns, *frame[1:]
+
+
 class UsbStream:
     def __init__(self):
         self.boot = None
@@ -257,8 +289,9 @@ class UsbStream:
             self.gaps[bus] += delta - 1
         self.sequences[bus] = sequence
         self.frames[bus] += 1
-        self.last_ns = max(1, self.last_ns, min(device_ns + self.offset_ns, 0xffffffffffffffff))
-        return self.last_ns, bus, *payload
+        timestamp_ns = max(1, min(device_ns + self.offset_ns, 0xffffffffffffffff - (1 << 32)))
+        self.last_ns = max(self.last_ns, timestamp_ns)
+        return timestamp_ns, bus, *payload
 
 
 class TerminalStatus:
@@ -631,6 +664,7 @@ def run(args):
         schema.write_text(CAN_SCHEMA, encoding='utf-8')
         event_type = capnp.load(str(schema)).Event
     stream = UsbStream()
+    reorder = FrameReorder()
     with zmq.Context() as context, context.socket(zmq.PUB) as publisher:
         publisher.linger = 0
         try:
@@ -638,6 +672,16 @@ def run(args):
         except zmq.ZMQError as error:
             raise RuntimeError(f'Cannot listen on {endpoint}: {error}') from error
         status = TerminalStatus(stream, enabled=not args.no_status)
+
+        def publish_ready(now_ns, flush=False):
+            for timestamp, bus, can_id, data in reorder.ready(now_ns, flush):
+                event = event_type.new_message(logMonoTime=timestamp)
+                frame = event.init('can', 1)[0]
+                frame.src = bus
+                frame.address = can_id
+                frame.dat = data
+                publisher.send(event.to_bytes())
+
         try:
             status.log('DashKit USB Serial -> Cabana / ZMQ')
             status.log(f'Publishing CAN at {endpoint}')
@@ -645,6 +689,8 @@ def run(args):
             status.log('RX frame rates refresh every second. Ctrl+C to stop.')
             status.log('')
             connected_once = False
+            reported_late = 0
+            last_late_report = time.monotonic()
             while True:
                 try:
                     port = args.port or detect_port(list_ports.comports())
@@ -655,15 +701,25 @@ def run(args):
                         try:
                             while True:
                                 stream.maintain_session(usb)
-                                for timestamp, bus, can_id, data in stream.feed(
-                                        usb.read(min(usb.in_waiting, 65536) or 1), status.firmware_log):
-                                    event = event_type.new_message(logMonoTime=timestamp)
-                                    frame = event.init('can', 1)[0]
-                                    frame.src = bus
-                                    frame.address = can_id
-                                    frame.dat = data
-                                    publisher.send(event.to_bytes())
+                                waiting = usb.in_waiting
+                                if not waiting:
+                                    timeout = 0.1
+                                    if reorder.pending:
+                                        deadline = reorder.pending[0][2]
+                                        timeout = max(0.0, (deadline - time.monotonic_ns()) / 1e9)
+                                    if usb.timeout != timeout:
+                                        usb.timeout = timeout
+                                chunk = usb.read(min(waiting, 65536) or 1)
+                                now_ns = time.monotonic_ns()
+                                for frame in stream.feed(chunk, status.firmware_log):
+                                    reorder.push(frame, now_ns)
+                                publish_ready(now_ns)
                                 status.update()
+                                now = time.monotonic()
+                                if reorder.late != reported_late and now - last_late_report >= 1:
+                                    reported_late = reorder.late
+                                    last_late_report = now
+                                    status.log(f'Late CAN timestamps: {reported_late:,} total.')
                         except KeyboardInterrupt:
                             if stream.session_ready:
                                 try:
@@ -671,6 +727,8 @@ def run(args):
                                 except (serial.SerialException, OSError):
                                     pass
                             raise
+                        finally:
+                            publish_ready(time.monotonic_ns(), flush=True)
                 except (serial.SerialException, OSError) as error:
                     stream.reset_input()
                     status.set_state('Reconnecting' if connected_once else 'Waiting for USB')
