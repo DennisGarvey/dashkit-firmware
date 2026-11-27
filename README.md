@@ -127,8 +127,9 @@ with no software whitelist. Controllers run in listen-only mode; loopback tests,
 vehicle controls, automations, BLE and NVS initialization are bypassed. The normal
 build retains its existing filtering and behavior.
 
-Both buses use 500 kbit/s nominal timing; CAN FD data timing defaults to 2 Mbit/s.
-The receive FIFOs hold 24 frames with room for up to 64 payload bytes each.
+Both buses capture Classic CAN at 500 kbit/s. Each controller has four
+24-frame receive FIFOs for payloads up to eight bytes. CAN FD frames are
+omitted from the capture.
 Capturing a bus with different timing requires configuring matching timing first.
 
 Use the repository's pinned ESP-IDF and keep its tools in this directory:
