@@ -2,8 +2,62 @@
 #include <stdio.h>
 #include "capture_protocol.h"
 
+static inline uint16_t reference_crc(const uint8_t *p, size_t n)
+{
+    uint16_t crc = 0xffff;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= (uint16_t)p[i] << 8;
+        for (int bit = 0; bit < 8; bit++)
+            crc = (uint16_t)((crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0));
+    }
+    return crc;
+}
+
+/* Appends CRC and COBS-encodes a payload of at most DK_MAX_RAW-2 bytes. */
+static inline size_t reference_encode(uint8_t *raw, size_t n, uint8_t *wire)
+{
+    if (n > DK_MAX_RAW - 2) return 0;
+    dk_put(raw + n, reference_crc(raw, n), 2);
+    n += 2;
+    size_t code_at = 0, out = 1;
+    uint8_t code = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (raw[i] == 0) {
+            wire[code_at] = code;
+            code_at = out++;
+            code = 1;
+        } else {
+            wire[out++] = raw[i];
+            code++;
+        }
+    }
+    wire[code_at] = code;
+    wire[out++] = 0;
+    return out;
+}
+
+static void check_wire_compatibility(void)
+{
+    uint32_t state = 0x12345678;
+    for (size_t len = 0; len <= DK_MAX_RAW - 2; ++len) {
+        for (unsigned pattern = 0; pattern < 32; ++pattern) {
+            uint8_t raw[DK_MAX_RAW] = {0}, reference_raw[DK_MAX_RAW] = {0};
+            uint8_t wire[DK_MAX_WIRE], reference_wire[DK_MAX_WIRE];
+            for (size_t i = 0; i < len; ++i) {
+                state = state * 1664525u + 1013904223u;
+                raw[i] = pattern == 0 ? 0 : pattern == 1 ? 0xff : (uint8_t)(state >> 24);
+            }
+            memcpy(reference_raw, raw, len);
+            const size_t encoded = dk_encode(raw, len, wire);
+            assert(encoded == reference_encode(reference_raw, len, reference_wire));
+            assert(memcmp(wire, reference_wire, encoded) == 0);
+        }
+    }
+}
+
 int main(void)
 {
+    check_wire_compatibility();
     assert(dk_crc((const uint8_t *)"123456789", 9) == 0x29b1);
     const uint8_t lengths[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
     for (size_t l = 0; l < sizeof(lengths); l++) {
