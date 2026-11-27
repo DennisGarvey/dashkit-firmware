@@ -2,41 +2,16 @@
 #include "led.h"
 #include "can_interface.h"
 #include "can_manager.h"
-#include "can_filter.h"
-#include "dbc.h"
-#include "automation_manager.h"
-#include "vehicle_control.h"
 #include "mcp251xfd.h"
-#include "ble_server.h"
-#include "ble_ota.h"
-#include "ble_appchan.h"
-#include "tesla_ble_adapter.h"
-#include "tesla_ble_client.h"
-#include "tesla_pairing.h"
 
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "nvs_flash.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include <string.h>
 
-#if !defined(CONFIG_DASHKIT_USB_CAPTURE) && (!defined(CONFIG_BT_NIMBLE_NVS_PERSIST) || (CONFIG_BT_NIMBLE_NVS_PERSIST != 1))
-#error "CONFIG_BT_NIMBLE_NVS_PERSIST must be enabled (bonds would be RAM-only)"
-#endif
 
 #if !defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE) || (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE != 1)
 #error "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE must be enabled (a crashing OTA image would brick the device)"
-#endif
-
-// Tesla BLE central client relies on the NimBLE central role (connect,
-// discovery, write/indicate against the vehicle). No observer: the app
-// provisions the car's address over the app channel.
-#if defined(CONFIG_DASHKIT_TESLA_BLE) && \
-    (!defined(CONFIG_BT_NIMBLE_ROLE_CENTRAL) || (CONFIG_BT_NIMBLE_ROLE_CENTRAL != 1))
-#error "CONFIG_DASHKIT_TESLA_BLE requires CONFIG_BT_NIMBLE_ROLE_CENTRAL (set CONFIG_BT_NIMBLE_ROLE_CENTRAL=y)"
 #endif
 
 static const char *TAG = "main";
@@ -56,122 +31,17 @@ static void mark_app_valid_cb(void *arg)
     }
 }
 
-#ifndef CONFIG_DASHKIT_USB_CAPTURE
-#define BLE_BATCH_MAX_FRAMES  16
-#define BLE_BATCH_TIMEOUT_MS  20
-
-// Build a DashPilot-compatible BLE packet from CAN frames.
-// Format: [count][timestamp_us_LE32, bus, addr_LE32, len, data...]...
-static size_t build_ble_packet(const can_tagged_frame_t *frames, int count, uint8_t *buf, size_t buf_size)
-{
-    size_t pos = 0;
-
-    if (count <= 0 || pos >= buf_size) return 0;
-
-    buf[pos++] = (uint8_t)count;
-
-    for (int i = 0; i < count && pos < buf_size; i++) {
-        const can_tagged_frame_t *f = &frames[i];
-        uint8_t data_len = f->frame.dlc;
-        if (data_len > 8) data_len = 8;  // DashPilot expects classic CAN (max 8)
-
-        // Check we have room: timestamp(4) + bus(1) + addr(4) + len(1) + data(n)
-        if (pos + 10 + data_len > buf_size) {
-            buf[0] = (uint8_t)i;  // Adjust count to what we actually packed
-            break;
-        }
-
-        // Timestamp in little-endian 32-bit (microseconds since boot)
-        uint32_t ts = f->timestamp_us;
-        buf[pos++] = (ts >>  0) & 0xFF;
-        buf[pos++] = (ts >>  8) & 0xFF;
-        buf[pos++] = (ts >> 16) & 0xFF;
-        buf[pos++] = (ts >> 24) & 0xFF;
-
-        buf[pos++] = f->bus_id;
-
-        // Address in little-endian 32-bit
-        uint32_t id = f->frame.id;
-        buf[pos++] = (id >>  0) & 0xFF;
-        buf[pos++] = (id >>  8) & 0xFF;
-        buf[pos++] = (id >> 16) & 0xFF;
-        buf[pos++] = (id >> 24) & 0xFF;
-
-        buf[pos++] = data_len;
-        memcpy(&buf[pos], f->frame.data, data_len);
-        pos += data_len;
-    }
-
-    return pos;
-}
-
-// Task that bridges CAN frames to BLE notifications
-static void can_to_ble_task(void *arg)
-{
-    (void)arg;
-    static can_tagged_frame_t batch[BLE_BATCH_MAX_FRAMES];
-    static uint8_t ble_buf[512];
-
-    while (true) {
-        int count = 0;
-
-        if (can_manager_receive(&batch[0], 100) == ESP_OK) {
-            count = 1;
-
-            while (count < BLE_BATCH_MAX_FRAMES) {
-                if (can_manager_receive(&batch[count], BLE_BATCH_TIMEOUT_MS) != ESP_OK) {
-                    break;
-                }
-                count++;
-            }
-
-            // Send over BLE if connected
-            if (ble_server_is_connected()) {
-                size_t pkt_len = build_ble_packet(batch, count, ble_buf, sizeof(ble_buf));
-                if (pkt_len > 0) {
-                    ble_server_notify(ble_buf, pkt_len);
-                }
-            }
-        }
-    }
-}
-
-#endif
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "DashKit firmware starting... (reset reason=%d)",
              (int)esp_reset_reason());
 
-    esp_err_t err;
-#ifndef CONFIG_DASHKIT_USB_CAPTURE
-    // Initialize NVS (required for BLE)
-    err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        // Erases the bond store: a bonded phone then hits the iOS stale-bond wall
-        // and can't re-pair to this address on its own. Loud on purpose.
-        ESP_LOGE(TAG, "NVS re-init (%s): erasing — all bonds will be lost",
-                 esp_err_to_name(err));
-        nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-#endif
-
     ESP_ERROR_CHECK(led_init());
     led_set_color(LED_COLOR_BLUE);
 
     ESP_ERROR_CHECK(can_manager_init());
 
-#ifndef CONFIG_DASHKIT_USB_CAPTURE
-    ESP_ERROR_CHECK(can_filter_init());
-
-    dbc_init();
-
-    ESP_ERROR_CHECK(automation_manager_init());
-
-    ESP_ERROR_CHECK(vehicle_control_init());
-#endif
 
     // CAN interface 0 (MCP2518FD)
     mcp251xfd_config_t can0_cfg = {
@@ -218,36 +88,13 @@ void app_main(void)
     ESP_ERROR_CHECK(can_manager_add_interface(can1));
 
     // Start CAN
-    err = can_manager_start();
+    esp_err_t err = can_manager_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CAN manager start failed");
         led_set_color(LED_COLOR_RED);
         return;
     }
 
-#ifndef CONFIG_DASHKIT_USB_CAPTURE
-    // BLE
-    ESP_ERROR_CHECK(ble_server_init());
-    ESP_ERROR_CHECK(ble_ota_init());
-    ESP_ERROR_CHECK(ble_appchan_init());
-    ESP_ERROR_CHECK(ble_server_start());
-
-#if defined(CONFIG_DASHKIT_TESLA_BLE)
-    // Boot canary for the Tesla link: role state must be visible and a missing
-    // key/link must not be silent. The app provisions the car (opcode 0x04)
-    // and starts enrollment (0x01); until then the firmware only reports
-    // "never enrolled".
-    ESP_LOGI(TAG, "Tesla BLE: enabled (central=%d). Persistent VCSEC status "
-                  "poll; enrollment is provisioned + started from the app.",
-             CONFIG_BT_NIMBLE_ROLE_CENTRAL);
-    ESP_ERROR_CHECK(tesla_pairing_init());
-    ESP_ERROR_CHECK(tesla_ble_client_init());
-#endif
-
-    // Bridge task: CAN -> BLE
-    xTaskCreatePinnedToCore(can_to_ble_task, "can2ble", 8192, NULL, 5, NULL, 0);
-
-#endif
 
     ESP_LOGI(TAG, "DashKit firmware ready");
 

@@ -42,12 +42,12 @@ typedef struct can_interface {
     esp_err_t (*init)(struct can_interface *self);
     esp_err_t (*start)(struct can_interface *self);
     esp_err_t (*stop)(struct can_interface *self);
-    esp_err_t (*send)(struct can_interface *self, const can_frame_t *frame);
 #ifdef CONFIG_DASHKIT_USB_TX
+    esp_err_t (*send)(struct can_interface *self, const can_frame_t *frame);
     esp_err_t (*poll_tx)(struct can_interface *self, bool abort, can_tx_diagnostics_t *diagnostics);
 #endif
     void (*set_rx_callback)(struct can_interface *self, can_rx_callback_t cb, void *user_ctx);
 
-    uint8_t bus_id;        // Bus index (1-based, matching DashPilot convention)
+    uint8_t bus_id;        // Zero-based CAN bus index
     void   *ctx;           // Driver-specific context
 } can_interface_t;

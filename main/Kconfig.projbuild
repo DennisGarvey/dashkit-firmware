@@ -1,58 +1,9 @@
-# DashKit project-configuration menu.
-#
-# CONFIG_DASHKIT_TESLA_BLE gates the Tesla BLE vehicle-command client: the
-# CENTRAL role connects to the car (VCSEC handshake + persistent GET_STATUS
-# poll), backed by main/tesla/ and the tesla-protocol component. There is no
-# observer/scan path — the app provisions the car's VIN + BLE address over the
-# app-channel service. Disabling the option removes the tesla/ modules and the
-# BLE central role from the build, so the stack stays exactly as a
-# dashboard-only device expects it.
 menu "DashKit"
-    config DASHKIT_USB_CAPTURE
-        bool "Passive USB CAN capture"
-        select FREERTOS_GENERATE_RUN_TIME_STATS
-        default n
-        help
-            Accept all standard and extended IDs on both controllers in
-            listen-only mode. Stream timestamped records over USB Serial/JTAG.
-            Vehicle controls, automations and BLE are not started.
-
     config DASHKIT_USB_TX
         bool "USB CAN transmission"
-        depends on DASHKIT_USB_CAPTURE
         default n
         help
             Enable manual CAN transmission via USB on an isolated CAN network.
             Both controllers participate in bus traffic in this build.
 
-    config DASHKIT_TESLA_BLE
-        bool "Tesla BLE vehicle-command client"
-        depends on BT_ENABLED && BT_NIMBLE_ENABLED
-        select BT_NIMBLE_ROLE_CENTRAL
-        default y
-        help
-            Adds the Tesla BLE vehicle-command client (connect, VCSEC
-            handshake, persistent GET_STATUS poll) driven entirely from the
-            phone app. Disabling removes the tesla/ modules and the BLE
-            central role from the build.
-
-    config DASHKIT_BTHOME
-        bool "BTHome button listener (Shelly BLU)"
-        depends on BT_ENABLED && BT_NIMBLE_ENABLED
-        select BT_NIMBLE_ROLE_OBSERVER
-        default n
-        help
-            Passive scan for BTHome v2 advertisements (Shelly BLU buttons),
-            mapping button events to vehicle controls. Work in progress.
-
-    config DASHKIT_BTHOME_ALLOWED
-        string "Allowed BTHome button addresses"
-        depends on DASHKIT_BTHOME
-        default ""
-        help
-            Comma-separated addresses of the buttons allowed to trigger
-            vehicle controls, as the log prints them ("BTHome device
-            AA:BB:CC:DD:EE:FF seen"). BTHome advertisements are unauthenticated,
-            so events from any other device are ignored. Empty: no button
-            triggers anything; nearby devices are only logged.
 endmenu
