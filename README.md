@@ -65,11 +65,6 @@ Host protocol tests:
 ./tools/test/run_capture_protocol_test.sh
 ```
 
-Before installing capture firmware, preserve a verified flash backup and inspect
-the installed partition layout, active OTA slot and flash security state. Preserve
-NVS and an existing recovery image when selecting the application slot to write.
-Do not use a full flash erase as part of capture installation.
-
 ## Project Layout
 
 - `main/can/` contains the MCP251xFD driver and CAN manager.
