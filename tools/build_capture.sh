@@ -13,7 +13,11 @@ case "${1:-}" in
         profile=usb-tx
         defaults="$defaults;sdkconfig.usb-tx"
         ;;
-    *) echo "Usage: $0 [--usb-tx]" >&2; exit 2 ;;
+    --usb-tx-classic)
+        profile=usb-tx-classic
+        defaults="$defaults;sdkconfig.usb-tx;sdkconfig.usb-tx-classic"
+        ;;
+    *) echo "Usage: $0 [--usb-tx | --usb-tx-classic]" >&2; exit 2 ;;
 esac
 idf.py -B "build-$profile" -DIDF_TARGET=esp32s3 \
     -D "SDKCONFIG=sdkconfig.$profile.generated" \

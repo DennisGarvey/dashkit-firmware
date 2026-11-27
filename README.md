@@ -139,6 +139,15 @@ over USB. Both controllers enter active CAN FD mode at startup.
 FLASH_BUILD=build-usb-tx
 ```
 
+**Classic CAN USB transmit** uses four 24-frame receive FIFOs per controller.
+It supports 8-byte Classic CAN frames on both buses and retains USB transmit
+and feedback. Use it on networks that carry only Classic CAN.
+
+```bash
+./tools/build_capture.sh --usb-tx-classic
+FLASH_BUILD=build-usb-tx-classic
+```
+
 #### 2. Prepare the adapter
 1. Connect the adapter over USB. In Cabana, use **File → Close stream** and
    close any serial monitor that has the device open.

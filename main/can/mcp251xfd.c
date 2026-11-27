@@ -1,5 +1,8 @@
 #include "mcp251xfd_rx_clock.h"
 #include "mcp251xfd.h"
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#include "mcp251xfd_classic_rx.h"
+#endif
 #ifdef CONFIG_DASHKIT_USB_CAPTURE
 #include "usb_capture.h"
 #endif
@@ -10,6 +13,9 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <stdbool.h>
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#include <stdatomic.h>
+#endif
 #include <string.h>
 
 static const char *TAG = "mcp251xfd";
@@ -148,7 +154,13 @@ typedef struct {
 #else
     _Alignas(4) uint8_t spi_tx[64];
 #endif
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+    mcp251xfd_classic_rx_t classic_rx;
+    atomic_bool classic_rx_ready;
+    _Alignas(4) uint8_t spi_rx[MCP_CLASSIC_CHUNK_BYTES];
+#else
     _Alignas(4) uint8_t spi_rx[64];
+#endif
 #endif
     mcp251xfd_rx_clock_t rx_clock;
     int64_t rx_clock_sample_due;
@@ -389,8 +401,52 @@ static esp_err_t configure_bitrate(mcp251xfd_ctx_t *ctx)
     return ESP_OK;
 }
 
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+static esp_err_t classic_read(void *io, uint16_t addr, uint8_t *data, size_t len)
+{
+    return spi_read_reg(io, addr, data, len);
+}
+
+static esp_err_t classic_write(void *io, uint16_t addr, uint32_t value)
+{
+    return write_reg32(io, addr, value);
+}
+
+static void classic_deliver(void *io, const can_frame_t *frame, uint32_t counter)
+{
+    mcp251xfd_ctx_t *ctx = io;
+    if (!ctx->rx_cb) return;
+    const can_tagged_frame_t tagged = {
+        .frame = *frame,
+        .bus_id = ctx->bus_id,
+        .capture_timestamp_us = mcp251xfd_rx_clock_time(&ctx->rx_clock, counter),
+    };
+    ctx->rx_cb(&tagged, ctx->rx_cb_ctx);
+}
+
+static void classic_overflow(void *io)
+{
+    mcp251xfd_ctx_t *ctx = io;
+    usb_capture_overflow(ctx->bus_id);
+}
+#endif
+
 static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
 {
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+    ctx->classic_rx = (mcp251xfd_classic_rx_t) {
+        .io = ctx,
+        .read = classic_read,
+        .write = classic_write,
+        .deliver = classic_deliver,
+        .overflow = classic_overflow,
+    };
+    // FIFO 2 remains single-slot TX. The Classic RX layout leaves space
+    // for its 72-byte object and the 8-byte transmit event object.
+    esp_err_t err = write_reg32(ctx, REG_C1FIFOCON(2),
+                                (7u << FIFOCON_PLSIZE_SHIFT) | FIFOCON_TXEN | FIFOCON_TXATIE);
+    return err == ESP_OK ? mcp251xfd_classic_configure(&ctx->classic_rx) : err;
+#else
     // FIFO 1: RX FIFO - 32 messages deep (max for FSIZE field), 8 byte payload.
     // 32 * 16 bytes = 512 B of the chip's 2 KB RAM. TX FIFO uses another 64 B.
     // Larger depth absorbs SPI/scheduling jitter (both CAN chips share SPI2,
@@ -455,6 +511,7 @@ static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
 #endif
 
     return ESP_OK;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +529,15 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 
 static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
 {
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+    if (!atomic_load(&ctx->classic_rx_ready)) return;
+    // Give the other controller a scheduling opportunity between chunks.
+    // Poll again immediately while frames remain on this controller.
+    while (ctx->running && mcp251xfd_classic_drain(&ctx->classic_rx)) {
+        sample_rx_clock(ctx);
+        taskYIELD();
+    }
+#else
 #ifdef CONFIG_DASHKIT_USB_CAPTURE
     const size_t payload_offset = 12;
     uint8_t msg[20];
@@ -562,6 +628,7 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
             ctx->rx_cb(&tagged, ctx->rx_cb_ctx);
         }
     }
+#endif
 }
 
 #ifndef CONFIG_DASHKIT_USB_CAPTURE
@@ -854,11 +921,16 @@ static esp_err_t iface_start(can_interface_t *self)
     // Re-enter config mode to reset FIFOs after loopback tests
     set_mode(ctx, OPMODE_CONFIG);
 
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+    esp_err_t reset_err = mcp251xfd_classic_reset(&ctx->classic_rx);
+    if (reset_err != ESP_OK) return reset_err;
+#else
     // Reset RX FIFO 1
     uint32_t fifocon_reset;
     read_reg32(ctx, REG_C1FIFOCON(1), &fifocon_reset);
     fifocon_reset |= FIFOCON_FRESET;
     write_reg32(ctx, REG_C1FIFOCON(1), fifocon_reset);
+#endif
     vTaskDelay(pdMS_TO_TICKS(1));
 
     // Clear all interrupt flags
@@ -870,7 +942,9 @@ static esp_err_t iface_start(can_interface_t *self)
     // (ACKs incoming frames and sends queued TX frames). Required for the
     // BLE CAN TX characteristic to actually put frames on the bus.
     // For passive monitoring only, change to OPMODE_LISTEN_ONLY.
-#if defined(CONFIG_DASHKIT_USB_TX)
+#if defined(CONFIG_DASHKIT_USB_TX_CLASSIC)
+    esp_err_t err = set_mode(ctx, OPMODE_NORMAL_2_0);
+#elif defined(CONFIG_DASHKIT_USB_TX)
     esp_err_t err = set_mode(ctx, OPMODE_NORMAL_FD);
 #elif defined(CONFIG_DASHKIT_USB_CAPTURE)
     esp_err_t err = set_mode(ctx, OPMODE_LISTEN_ONLY);
@@ -882,6 +956,9 @@ static esp_err_t iface_start(can_interface_t *self)
         return err;
     }
 
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+    atomic_store(&ctx->classic_rx_ready, true);
+#endif
     return ESP_OK;
 }
 
@@ -889,6 +966,9 @@ static esp_err_t iface_stop(can_interface_t *self)
 {
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
     ctx->running = false;
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+    atomic_store(&ctx->classic_rx_ready, false);
+#endif
 
     gpio_isr_handler_remove(ctx->pin_int);
 
@@ -948,6 +1028,9 @@ static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
 {
 #if defined(CONFIG_DASHKIT_USB_CAPTURE) && !defined(CONFIG_DASHKIT_USB_TX)
     return ESP_ERR_NOT_SUPPORTED;
+#endif
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+    if (frame->fd || frame->brs || frame->dlc > 8) return ESP_ERR_NOT_SUPPORTED;
 #endif
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
 
@@ -1042,7 +1125,11 @@ can_interface_t *mcp251xfd_create(const mcp251xfd_config_t *config)
         .sclk_io_num = config->pin_sclk,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
+#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+        .max_transfer_sz = MCP_CLASSIC_CHUNK_BYTES + 4,
+#else
         .max_transfer_sz = 76,  // 8 header + 4 cmd + 64 data
+#endif
     };
 
     esp_err_t err = spi_bus_initialize(config->spi_host, &bus_cfg, SPI_DMA_CH_AUTO);
