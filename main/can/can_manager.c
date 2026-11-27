@@ -44,9 +44,7 @@ esp_err_t can_manager_start(void)
             return err;
         }
     }
-#ifdef CONFIG_DASHKIT_USB_TX
     usb_capture_enable_tx();
-#endif
     return ESP_OK;
 }
 
@@ -58,7 +56,6 @@ esp_err_t can_manager_stop(void)
     return ESP_OK;
 }
 
-#ifdef CONFIG_DASHKIT_USB_TX
 esp_err_t can_manager_send(uint8_t bus_id, const can_frame_t *frame)
 {
     if (!frame) return ESP_ERR_INVALID_ARG;
@@ -80,4 +77,3 @@ esp_err_t can_manager_poll_tx(uint8_t bus_id, bool abort, can_tx_diagnostics_t *
     }
     return ESP_ERR_NOT_FOUND;
 }
-#endif

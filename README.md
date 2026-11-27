@@ -1,6 +1,6 @@
 # DashKit Firmware
 
-USB CAN capture and transmission firmware for DashKit.
+USB CAN transmission firmware for DashKit.
 
 ## Building
 
@@ -24,24 +24,13 @@ export IDF_TOOLS_PATH="$PWD/.idf-tools"
 
 ### Flashing firmware
 
-#### 1. Build and select a profile
-
-Run the block for the profile you want. Each build uses its own configuration
-and output directory.
-
-**Passive USB streaming** captures both CAN buses in listen-only mode. It
-receives frames without transmitting or acknowledging them.
-
-```bash
-./tools/build_capture.sh
-FLASH_BUILD=build-capture
-```
+#### 1. Build the firmware
 
 **USB transmission** streams both buses and accepts manual transmit requests
 over USB. Both controllers enter active Classic CAN mode at startup.
 
 ```bash
-./tools/build_capture.sh --usb-tx
+./tools/build_capture.sh
 FLASH_BUILD=build-usb-tx
 ```
 
@@ -84,43 +73,10 @@ advertises transmission support.
 Reconnect the CAN buses only after confirming which firmware is running.
 Use USB transmission on an isolated CAN network.
 
-### Passive USB streaming
-
-The passive USB build streams received CAN frames over USB. Both MCP2518FD
-controllers use a zero-mask acceptance filter for all standard and extended IDs,
-with no software whitelist. Controllers run in listen-only mode.
-
-Both buses use 500 kbit/s nominal timing; CAN FD data timing defaults to 2 Mbit/s.
-The receive FIFOs hold 24 frames with room for up to 64 payload bytes each.
-Capturing a bus with different timing requires configuring matching timing first.
-
-The passive USB build uses `build-capture/sdkconfig.generated` and the defaults in
-`sdkconfig.defaults`. It disables both console outputs
-so diagnostic text does not share the binary USB stream.
-
-USB Serial/JTAG streams COBS-delimited records with CRC16-CCITT, a boot identifier,
-per-bus sequence numbers, 64-bit controller receive timestamps in device-uptime microseconds, and CAN flags. The
-format is defined in `main/capture/capture_protocol.h`. A separate USB task drains
-a 1,024-frame queue without blocking the CAN receive tasks, batching records into
-full USB transfers. The capture profile uses the 240 MHz CPU setting, performance
-compiler optimization and DMA-aligned polling SPI transfers. Status records report
-queue drops, hardware FIFO overflow events and aborted USB writes. Overflow events
-are a lower bound on lost frames; sequence gaps and the other drop counters can
-overlap and must not be added together. Frames before the host connects cannot be
-recovered. Sustained capture throughput needs validation on the connected vehicle.
-SPI-level CRC checking and a separate SPI error counter are not implemented; a
-zero drop count does not independently verify every frame on the wire.
-
-Host protocol tests:
-
-```sh
-./tools/test/run_capture_protocol_test.sh
-```
-
 ### USB transmission
 
-Run `./tools/build_capture.sh --usb-tx` to build
-`build-usb-tx/dashkit-firmware.bin`. This profile runs both controllers in
+Run `./tools/build_capture.sh` to build
+`build-usb-tx/dashkit-firmware.bin`. This firmware runs both controllers in
 active Classic CAN mode and starts acknowledging frames at startup. Each
 controller uses four 24-frame receive FIFOs and supports 8-byte payloads.
 Use transmit controls on an isolated CAN network.

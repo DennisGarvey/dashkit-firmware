@@ -62,7 +62,6 @@ jobs:
           IDF_TOOLS_PATH: /home/runner/.espressif
         run: |
           bash tools/build_capture.sh
-          bash tools/build_capture.sh --usb-tx
           ccache -s
 
       - name: Run capture protocol and CAN receive tests
@@ -72,5 +71,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dashkit-firmware-${{ github.sha }}
-          path: build-*/dashkit-firmware.bin
+          path: build-usb-tx/dashkit-firmware.bin
           retention-days: 14

@@ -2,9 +2,7 @@
 #include "capture_protocol.h"
 #include "board.h"
 #include <stdatomic.h>
-#ifdef CONFIG_DASHKIT_USB_TX
 #include "can_manager.h"
-#endif
 
 #include "driver/usb_serial_jtag.h"
 #include "esp_random.h"
@@ -64,7 +62,6 @@ static void account_can_frame(uint8_t bus, const can_frame_t *frame)
     s_can_data_bits[bus] += data;
 }
 
-#ifdef CONFIG_DASHKIT_USB_TX
 static TaskHandle_t s_capture_task;
 static QueueHandle_t s_usb_output_queue;
 
@@ -123,7 +120,6 @@ static void observe_repeat(const can_tagged_frame_t *received, uint32_t generati
     portEXIT_CRITICAL(&s_repeat_lock);
     if (wake) usb_capture_notify_tx_event();
 }
-#endif
 
 void usb_capture_overflow(uint8_t bus_id)
 {
@@ -138,9 +134,7 @@ void usb_capture_submit(const can_tagged_frame_t *frame)
     if (!s_queue || frame->bus_id > 1) return;
     const uint32_t generation = atomic_load_explicit(&s_capture_generation, memory_order_relaxed);
     if (!generation) return;
-#ifdef CONFIG_DASHKIT_USB_TX
     observe_repeat(frame, generation);
-#endif
     capture_item_t item = { .frame = *frame, .generation = generation };
     portENTER_CRITICAL(&s_lock);
     if (generation != atomic_load_explicit(&s_capture_generation, memory_order_relaxed)) {
@@ -182,7 +176,6 @@ static bool send_usb_output(const usb_output_t *output)
     return true;
 }
 
-#ifdef CONFIG_DASHKIT_USB_TX
 static void usb_output_task(void *arg)
 {
     (void)arg;
@@ -193,18 +186,13 @@ static void usb_output_task(void *arg)
         }
     }
 }
-#endif
 
 static bool flush_records(void)
 {
     if (!s_output.size) return true;
-#ifdef CONFIG_DASHKIT_USB_TX
     // Never let a blocked USB reader hold up CAN scheduling or ACK handling.
     const bool sent = xQueueSend(s_usb_output_queue, &s_output, 0) == pdTRUE;
     if (!sent) atomic_fetch_add_explicit(&s_usb_aborts, 1, memory_order_relaxed);
-#else
-    const bool sent = send_usb_output(&s_output);
-#endif
     s_output.size = 0;
     return sent;
 }
@@ -241,11 +229,9 @@ static void stop_capture_session(void)
     s_session_id = 0;
     s_output.size = 0;
     xQueueReset(s_queue);
-#ifdef CONFIG_DASHKIT_USB_TX
     xQueueReset(s_usb_output_queue);
     if (s_repeat.sequence && !s_repeat.finish_status)
         s_repeat.finish_status = DK_TX_REPEAT_LEASE_EXPIRED;
-#endif
 }
 
 static void handle_session_request(uint64_t id, uint8_t opcode, int64_t now)
@@ -286,7 +272,6 @@ static void write_can_frame(uint8_t type, uint8_t bus, uint32_t sequence,
     write_record(raw, 25 + raw[24]);
 }
 
-#ifdef CONFIG_DASHKIT_USB_TX
 static atomic_bool s_tx_ready;
 
 void usb_capture_enable_tx(void)
@@ -442,7 +427,6 @@ static void service_repeat(void)
     }
 }
 
-#endif
 
 static void read_usb_requests(void)
 {
@@ -467,7 +451,6 @@ static void read_usb_requests(void)
             handle_session_request(dk_get(raw + 12, 8), raw[20], esp_timer_get_time());
             continue;
         }
-#ifdef CONFIG_DASHKIT_USB_TX
         if (!s_session_id || dk_get(raw + 4, 4) != s_boot_id || !atomic_load(&s_tx_ready)) continue;
 
         uint32_t sequence = dk_get(raw + 8, 4);
@@ -561,7 +544,6 @@ static void read_usb_requests(void)
             uint8_t status = send_frame(bus, &frame, sequence);
             write_tx_result(result_type, bus, sequence, status);
         }
-#endif
     }
 }
 
@@ -617,14 +599,10 @@ static void capture_task(void *arg)
     (void)arg;
     int64_t next_status = 0;
     int64_t next_flush = 0;
-#ifndef CONFIG_DASHKIT_USB_TX
-    int64_t next_control_poll = 0;
-#endif
     capture_item_t item;
     while (true) {
         const int64_t loop_time = esp_timer_get_time();
         if (s_session_id && loop_time >= s_session_deadline) stop_capture_session();
-#ifdef CONFIG_DASHKIT_USB_TX
         read_usb_requests();
         update_repeat_stop(esp_timer_get_time());
         service_tx_feedback();
@@ -638,16 +616,6 @@ static void capture_task(void *arg)
             // still services deadlines and covers missed GPIO edges.
             ulTaskNotifyTake(pdTRUE, 1);
         }
-#else
-        if (loop_time >= next_control_poll) {
-            read_usb_requests();
-            next_control_poll = loop_time + 1000;
-        }
-        if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(2)) == pdTRUE) {
-            if (item.generation == atomic_load_explicit(&s_capture_generation, memory_order_relaxed))
-                write_can_frame(DK_FRAME, item.frame.bus_id, item.sequence, item.timestamp_us, &item.frame.frame);
-        }
-#endif
         int64_t now = esp_timer_get_time();
         if (s_session_id && now >= next_status) {
             write_utilization(now);
@@ -661,11 +629,9 @@ static void capture_task(void *arg)
                 dk_put(raw + 28, atomic_load_explicit(&s_usb_aborts, memory_order_relaxed), 4);
                 write_record(raw, DK_STATUS_SIZE);
             }
-#ifdef CONFIG_DASHKIT_USB_TX
             if (atomic_load(&s_tx_ready)) {
                 write_tx_result(DK_TX_RESULT, DK_TX_CAPABILITY, 0, DK_TX_READY);
             }
-#endif
             next_status = now + 1000000;
         }
         if (now >= next_flush) {
@@ -686,15 +652,11 @@ esp_err_t usb_capture_init(void)
     s_queue = xQueueCreate(CAPTURE_QUEUE_DEPTH, sizeof(capture_item_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
     s_boot_id = esp_random();
-#ifdef CONFIG_DASHKIT_USB_TX
     s_usb_output_queue = xQueueCreate(4, sizeof(usb_output_t));
     if (!s_usb_output_queue) return ESP_ERR_NO_MEM;
     if (xTaskCreatePinnedToCore(usb_output_task, "usb_output", 4096, NULL, 6, NULL, 0) != pdPASS)
         return ESP_ERR_NO_MEM;
     TaskHandle_t *capture_handle = &s_capture_task;
-#else
-    TaskHandle_t *capture_handle = NULL;
-#endif
     if (xTaskCreatePinnedToCore(capture_task, "can2usb", 4096, NULL, 5, capture_handle, 0) != pdPASS)
         return ESP_ERR_NO_MEM;
     return ESP_OK;

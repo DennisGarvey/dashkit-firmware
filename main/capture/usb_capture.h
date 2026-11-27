@@ -8,6 +8,4 @@ void usb_capture_submit(const can_tagged_frame_t *frame);
 void usb_capture_overflow(uint8_t bus_id);
 void usb_capture_account_spi(uint8_t bus_id, uint32_t clock_bits);
 
-#ifdef CONFIG_DASHKIT_USB_TX
 void usb_capture_notify_tx_event(void);
-#endif

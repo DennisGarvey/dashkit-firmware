@@ -1,14 +1,9 @@
-set(TX_SRCS "")
-if(CONFIG_DASHKIT_USB_TX)
-    list(APPEND TX_SRCS "can/mcp251xfd_classic_rx.c")
-endif()
-
 idf_component_register(
     SRCS
         "main.c"
         "led.c"
         "can/mcp251xfd.c"
-        ${TX_SRCS}
+        "can/mcp251xfd_classic_rx.c"
         "can/can_manager.c"
         "capture/usb_capture.c"
     INCLUDE_DIRS "." "can" "capture"

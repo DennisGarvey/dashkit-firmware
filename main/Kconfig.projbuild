@@ -1,9 +1,0 @@
-menu "DashKit"
-    config DASHKIT_USB_TX
-        bool "USB CAN transmission"
-        default n
-        help
-            Enable manual CAN transmission via USB on an isolated CAN network.
-            Both controllers participate in bus traffic in this build.
-
-endmenu
