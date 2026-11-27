@@ -21,6 +21,7 @@ typedef struct {
     can_frame_t frame;
     uint8_t     bus_id;
     uint32_t    timestamp_us;  // Microseconds since boot (lower 32 bits)
+    uint64_t    capture_timestamp_us;  // Controller RX time mapped to ESP uptime
 } can_tagged_frame_t;
 
 // Callback for received frames

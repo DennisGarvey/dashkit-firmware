@@ -82,7 +82,7 @@ void usb_capture_submit(const can_tagged_frame_t *frame)
     }
     account_can_frame(frame->bus_id, &frame->frame);
     item.sequence = ++s_sequence[frame->bus_id];
-    item.timestamp_us = esp_timer_get_time();
+    item.timestamp_us = frame->capture_timestamp_us ? frame->capture_timestamp_us : esp_timer_get_time();
     portEXIT_CRITICAL(&s_lock);
     if (xQueueSend(s_queue, &item, 0) != pdTRUE) {
         portENTER_CRITICAL(&s_lock);

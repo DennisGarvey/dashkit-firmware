@@ -145,7 +145,7 @@ The script builds `build-capture/dashkit-firmware.bin`, using
 both console outputs so diagnostic text does not share the binary USB stream.
 
 USB Serial/JTAG streams COBS-delimited records with CRC16-CCITT, a boot identifier,
-per-bus sequence numbers, 64-bit software receive timestamps and CAN flags. The
+per-bus sequence numbers, 64-bit controller receive timestamps in device-uptime microseconds, and CAN flags. The
 format is defined in `main/capture/capture_protocol.h`. A separate USB task drains
 a 1,024-frame queue without blocking the CAN receive tasks, batching records into
 full USB transfers. The capture profile uses the 240 MHz CPU setting, performance
