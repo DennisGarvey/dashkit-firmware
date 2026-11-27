@@ -155,13 +155,12 @@ REORDER_NS = 10_000_000
 
 
 class FrameReorder:
-    def __init__(self, preserve_late_timestamps=False):
+    def __init__(self):
         self.pending = []
         self.order = 0
         self.last_source_ns = 0
         self.last_published_ns = 0
-        self.late = 0
-        self.preserve_late_timestamps = preserve_late_timestamps
+        self.late_dropped = 0
 
     def push(self, frame, now_ns):
         timestamp, *_ = frame
@@ -175,14 +174,12 @@ class FrameReorder:
                 break
             heappop(self.pending)
             if timestamp < self.last_source_ns:
-                self.late += 1
-            self.last_source_ns = max(self.last_source_ns, timestamp)
-            if self.preserve_late_timestamps:
-                yield frame
-            else:
-                # Upstream live playback advances strictly beyond its cursor.
-                self.last_published_ns = max(timestamp, self.last_published_ns + 1)
-                yield self.last_published_ns, *frame[1:]
+                self.late_dropped += 1
+                continue
+            self.last_source_ns = timestamp
+            # Upstream live playback advances strictly beyond its cursor.
+            self.last_published_ns = max(timestamp, self.last_published_ns + 1)
+            yield self.last_published_ns, *frame[1:]
 
 
 class UsbStream:
@@ -300,8 +297,10 @@ class UsbStream:
 class TerminalStatus:
     """Scrolling event log and a fixed bottom status bar for the bridge."""
 
-    def __init__(self, stream, enabled=True):
+    def __init__(self, stream, reorder, enabled=True):
         self.stream = stream
+        self.reorder = reorder
+        self.reported_late_drops = 0
         self.state = 'Waiting for USB'
         self.port = None
         self.logs = deque(maxlen=2000)
@@ -436,6 +435,7 @@ class TerminalStatus:
             ['Bridge Counters (Since Launch)',
              f'USB Frame Sequence Gaps: {sum(self.stream.gaps):,}',
              f'Invalid USB Records: {self.stream.invalid:,}',
+             f'Late Frames Dropped: {self.reorder.late_dropped:,}',
              f'Device Reboots: {self.stream.restarts:,}'],
         ]
 
@@ -579,6 +579,12 @@ class TerminalStatus:
         self.port = port
         self._draw()
 
+    def report_late_drops(self):
+        total = self.reorder.late_dropped
+        if total != self.reported_late_drops:
+            self.log(f'Late Frames Dropped: +{total - self.reported_late_drops:,} ({total:,} total).')
+            self.reported_late_drops = total
+
     def update(self):
         try:
             redraw = self.enabled and self._poll_terminal()
@@ -611,6 +617,7 @@ class TerminalStatus:
         self.restarts = stream.restarts
         self.last_update = now
 
+        self.report_late_drops()
         if new_restarts:
             self.log(f'DashKit reboot detected ({stream.restarts:,} total).')
         if sum(new_gaps) or new_invalid:
@@ -667,14 +674,14 @@ def run(args):
         schema.write_text(CAN_SCHEMA, encoding='utf-8')
         event_type = capnp.load(str(schema)).Event
     stream = UsbStream()
-    reorder = FrameReorder(preserve_late_timestamps=args.preserve_late_timestamps)
+    reorder = FrameReorder()
     with zmq.Context() as context, context.socket(zmq.PUB) as publisher:
         publisher.linger = 0
         try:
             publisher.bind(endpoint)
         except zmq.ZMQError as error:
             raise RuntimeError(f'Cannot listen on {endpoint}: {error}') from error
-        status = TerminalStatus(stream, enabled=not args.no_status)
+        status = TerminalStatus(stream, reorder, enabled=not args.no_status)
 
         def publish_ready(now_ns, flush=False):
             for timestamp, bus, can_id, data in reorder.ready(now_ns, flush):
@@ -692,8 +699,6 @@ def run(args):
             status.log('RX frame rates refresh every second. Ctrl+C to stop.')
             status.log('')
             connected_once = False
-            reported_late = 0
-            last_late_report = time.monotonic()
             while True:
                 try:
                     port = args.port or detect_port(list_ports.comports())
@@ -718,11 +723,6 @@ def run(args):
                                     reorder.push(frame, now_ns)
                                 publish_ready(now_ns)
                                 status.update()
-                                now = time.monotonic()
-                                if reorder.late != reported_late and now - last_late_report >= 1:
-                                    reported_late = reorder.late
-                                    last_late_report = now
-                                    status.log(f'Late CAN timestamps: {reported_late:,} total.')
                         except KeyboardInterrupt:
                             if stream.session_ready:
                                 try:
@@ -732,6 +732,7 @@ def run(args):
                             raise
                         finally:
                             publish_ready(time.monotonic_ns(), flush=True)
+                            status.report_late_drops()
                 except (serial.SerialException, OSError) as error:
                     stream.reset_input()
                     status.set_state('Reconnecting' if connected_once else 'Waiting for USB')
@@ -750,8 +751,6 @@ def main():
     binding.add_argument('--tailscale', action='store_true',
                          help="Listen on this host's Tailscale IPv4 address")
     parser.add_argument('--baud', type=int, default=8000000, help='Serial line rate (default: %(default)s)')
-    parser.add_argument('--preserve-late-timestamps', action='store_true',
-                        help='Keep original timestamps for Cabana builds that support out-of-order live frames')
     parser.add_argument('--no-status', action='store_true',
                         help='Print logs and device metrics without the interactive status bar')
     args = parser.parse_args()

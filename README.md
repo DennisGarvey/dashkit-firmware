@@ -2,14 +2,10 @@
 
 Run `zmq_bridge.py` on the machine connected to DashKit over USB. It publishes received CAN frames on the standard Cabana ZMQ `can` endpoint, preserving the bus number, CAN ID, and payload. Cabana uses its built-in ZMQ input. Firmware logs and device metrics are displayed in the bridge terminal.
 
-The bridge buffers frames for at least 10 ms while streaming. By default, it
-publishes strictly increasing timestamps for upstream Cabana. A tied or late
-timestamp is moved just past the last published frame. The bridge reports late
-arrivals in its terminal output.
-
-With a Cabana build that supports out-of-order live frames, pass
-`--preserve-late-timestamps` to publish the original timestamps, including ties
-and late arrivals.
+The bridge buffers frames for at least 10 ms while streaming. It drops frames
+whose device timestamps are older than a timestamp already published and
+increments **Late Frames Dropped**. Frames with equal timestamps are retained
+and published at least one nanosecond apart for upstream Cabana.
 
 ## Requirements
 
@@ -89,6 +85,7 @@ DashKit reports these counters. A DashKit reboot resets them. Reconnecting to th
 The bridge counts these events until it exits. Reconnecting to DashKit preserves the totals.
 
 - **USB Frame Sequence Gaps** count missing CAN frame numbers in the stream received by the bridge.
+- **Late Frames Dropped** counts frames discarded after reordering because their timestamps were older than a frame already published. They are counted after USB sequence validation.
 - **Invalid USB Records** count records the bridge rejects, such as malformed records, CRC failures, or duplicate or out-of-order CAN frame numbers.
 - **Device Reboots** count changes in the firmware boot ID observed by the bridge.
 
