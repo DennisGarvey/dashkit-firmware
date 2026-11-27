@@ -1,3 +1,4 @@
+#include "mcp251xfd_rx_clock.h"
 #include "mcp251xfd_stream.h"
 
 #include <string.h>
@@ -33,7 +34,7 @@
 #define MASK_SID_LANE       (3u << MCPFD_LANE_SHIFT)
 
 // FIFOCON values we configure, so run-time writes need no read-modify-write.
-#define RX_CON(depth)   ((((uint32_t)(depth) - 1) << FIFOCON_FSIZE_SHIFT) | FIFOCON_TFNRFNIE)
+#define RX_CON(depth)   ((((uint32_t)(depth) - 1) << FIFOCON_FSIZE_SHIFT) | FIFOCON_TFNRFNIE | MCP251XFD_RX_TIMESTAMP_ENABLE)
 #define TX_CON          ((((uint32_t)MCPFD_TX_DEPTH - 1) << FIFOCON_FSIZE_SHIFT) | FIFOCON_TXEN)
 
 // ---------------------------------------------------------------------------
@@ -91,13 +92,13 @@ void mcpfd_stream_init(mcpfd_stream_t *s)
     uint16_t base = 0;
     for (int i = 0; i < MCPFD_LANES; i++) {
         s->lane[i] = (mcpfd_lane_t){ (uint8_t)MCPFD_LANE_FIFO(i), MCPFD_LANE_DEPTH, base, -1 };
-        base += MCPFD_LANE_DEPTH * MCPFD_OBJ_SIZE;
+        base += MCPFD_LANE_DEPTH * MCPFD_RX_OBJ_SIZE;
         if (i == 0) {
             s->tx_base = base;
-            base += MCPFD_TX_DEPTH * MCPFD_OBJ_SIZE;
+            base += MCPFD_TX_DEPTH * MCPFD_TX_OBJ_SIZE;
         }
     }
-    // base == MCPFD_RAM_SIZE here (checked by the host test).
+    // The configured FIFO objects fit within controller RAM.
 
     s->next_lane = 0;
     memset(&s->stats, 0, sizeof(s->stats));
@@ -178,7 +179,7 @@ void mcpfd_stream_parse(const uint8_t *obj, can_frame_t *out)
     // The FIFOs hold 8 payload bytes per message; a longer CAN FD frame is
     // delivered with its first 8.
     uint8_t len = out->dlc > 8 ? 8 : out->dlc;
-    memcpy(out->data, obj + 8, len);
+    memcpy(out->data, obj + 12, len);
 }
 
 // Messages waiting in an RX FIFO whose oldest one is at index `tail`, from one
@@ -218,7 +219,7 @@ static int rx_chunk(mcpfd_stream_t *s, int li, int max)
     int head = (int)FIFOSTA_FIFOCI(sta);
     int32_t off = (int32_t)ua - (int32_t)lane->base;
 
-    if (off < 0 || off >= depth * MCPFD_OBJ_SIZE || (off % MCPFD_OBJ_SIZE) != 0 || head >= depth) {
+    if (off < 0 || off >= depth * MCPFD_RX_OBJ_SIZE || (off % MCPFD_RX_OBJ_SIZE) != 0 || head >= depth) {
         // Not a state this FIFO can be in: a corrupted read (a chip that is
         // unpowered or in reset reads as all ones) or a layout that is not the
         // one configured. Nothing is delivered and nothing is released.
@@ -227,7 +228,7 @@ static int rx_chunk(mcpfd_stream_t *s, int li, int max)
         return 0;
     }
 
-    int tail = off / MCPFD_OBJ_SIZE;
+    int tail = off / MCPFD_RX_OBJ_SIZE;
     if (lane->expect_tail >= 0 && lane->expect_tail != tail) {
         s->stats.rx_desync++;
     }
@@ -262,7 +263,7 @@ static int rx_chunk(mcpfd_stream_t *s, int li, int max)
     if (run > depth - tail) run = depth - tail;   // up to the end of the ring
     if (run > max) run = max;
 
-    size_t bytes = (size_t)run * MCPFD_OBJ_SIZE;
+    size_t bytes = (size_t)run * MCPFD_RX_OBJ_SIZE;
     uint16_t cmd = SPI_CMD_READ(RAM_BASE + ua);
     memset(s->blk_tx, 0, 2 + bytes);
     s->blk_tx[0] = (uint8_t)(cmd >> 8);
@@ -288,7 +289,7 @@ int mcpfd_stream_step(mcpfd_stream_t *s, const mcpfd_hooks_t *h)
 {
     // The chunk is copied out of the SPI buffer before the lock is released, so
     // the buffers are only ever touched under the lock.
-    uint8_t objs[MCPFD_CHUNK * MCPFD_OBJ_SIZE];
+    uint8_t objs[MCPFD_CHUNK * MCPFD_RX_OBJ_SIZE];
     uint32_t rxif = 0;
     int n = 0;
 
@@ -300,7 +301,7 @@ int mcpfd_stream_step(mcpfd_stream_t *s, const mcpfd_hooks_t *h)
             if (rxif & (1u << s->lane[li].fifo)) {
                 s->next_lane = (uint8_t)((li + 1) % MCPFD_LANES);
                 n = rx_chunk(s, li, MCPFD_CHUNK);
-                if (n > 0) memcpy(objs, s->blk_rx + 2, (size_t)n * MCPFD_OBJ_SIZE);
+                if (n > 0) memcpy(objs, s->blk_rx + 2, (size_t)n * MCPFD_RX_OBJ_SIZE);
                 break;
             }
         }
@@ -309,8 +310,8 @@ int mcpfd_stream_step(mcpfd_stream_t *s, const mcpfd_hooks_t *h)
 
     can_frame_t f;
     for (int i = 0; i < n; i++) {
-        mcpfd_stream_parse(objs + (size_t)i * MCPFD_OBJ_SIZE, &f);
-        h->deliver(h->ctx, &f);
+        mcpfd_stream_parse(objs + (size_t)i * MCPFD_RX_OBJ_SIZE, &f);
+        h->deliver(h->ctx, &f, le32(objs + (size_t)i * MCPFD_RX_OBJ_SIZE + 8));
     }
     return n;
 }
@@ -343,13 +344,13 @@ esp_err_t mcpfd_stream_send(mcpfd_stream_t *s, const can_frame_t *frame)
 
     // Always the whole 16-byte slot, as the default driver does.
     uint16_t cmd = SPI_CMD_WRITE(RAM_BASE + ua);
-    memset(s->reg_tx, 0, 2 + MCPFD_OBJ_SIZE);
+    memset(s->reg_tx, 0, 2 + MCPFD_TX_OBJ_SIZE);
     s->reg_tx[0] = (uint8_t)(cmd >> 8);
     s->reg_tx[1] = (uint8_t)cmd;
     put_le32(s->reg_tx + 2, t0);
     put_le32(s->reg_tx + 6, t1);
     memcpy(s->reg_tx + 10, frame->data, frame->dlc);
-    err = xfer(s, s->reg_tx, NULL, 2 + MCPFD_OBJ_SIZE);
+    err = xfer(s, s->reg_tx, NULL, 2 + MCPFD_TX_OBJ_SIZE);
     if (err != ESP_OK) return err;
 
     err = reg_write32(s, REG_C1FIFOCON(MCPFD_FIFO_TX), TX_CON | FIFOCON_UINC | FIFOCON_TXREQ);

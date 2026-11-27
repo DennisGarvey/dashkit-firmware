@@ -1,3 +1,4 @@
+#include "mcp251xfd_rx_clock.h"
 #include "mcp251xfd.h"
 #ifdef CONFIG_DASHKIT_USB_STREAM
 #include "usb_capture.h"
@@ -118,6 +119,8 @@ typedef struct {
     mcpfd_stats_t       stats_reported;    // snapshot at the last report
     volatile uint32_t   step_max_us;       // longest single service step
     volatile uint32_t   busy_gap_max_us;   // longest gap between steps while frames were waiting
+    mcp251xfd_rx_clock_t rx_clock;
+    int64_t rx_clock_sample_due;
 } mcp251xfd_ctx_t;
 
 // ---------------------------------------------------------------------------
@@ -182,7 +185,7 @@ static esp_err_t read_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t *val)
     uint8_t d[4];
     esp_err_t err = spi_read_reg(ctx, addr, d, 4);
     if (err == ESP_OK) {
-        *val = d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24);
+        *val = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
     }
     return err;
 }
@@ -233,7 +236,7 @@ static void stream_unlock(void *arg)
     xSemaphoreGive(ctx->spi_mutex);
 }
 
-static void stream_deliver(void *arg, const can_frame_t *frame)
+static void stream_deliver(void *arg, const can_frame_t *frame, uint32_t counter)
 {
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)arg;
     if (!ctx->rx_cb) return;
@@ -241,6 +244,7 @@ static void stream_deliver(void *arg, const can_frame_t *frame)
     tagged.frame = *frame;
     tagged.bus_id = ctx->bus_id;
     tagged.timestamp_us = 0;
+    tagged.capture_timestamp_us = mcp251xfd_rx_clock_time(&ctx->rx_clock, counter);
     ctx->rx_cb(&tagged, ctx->rx_cb_ctx);
 }
 
@@ -280,6 +284,17 @@ static esp_err_t set_mode(mcp251xfd_ctx_t *ctx, uint8_t mode)
     }
     ESP_LOGE(TAG, "Failed to enter mode 0x%02x", mode);
     return ESP_ERR_TIMEOUT;
+}
+
+static void sample_rx_clock(mcp251xfd_ctx_t *ctx)
+{
+    const int64_t before = esp_timer_get_time();
+    if (before < ctx->rx_clock_sample_due) return;
+    ctx->rx_clock_sample_due = before + 1000000;
+    uint32_t counter;
+    if (read_reg32(ctx, MCP251XFD_TBC, &counter) == ESP_OK) {
+        mcp251xfd_rx_clock_sample(&ctx->rx_clock, counter, before, esp_timer_get_time());
+    }
 }
 
 static esp_err_t configure_bitrate(mcp251xfd_ctx_t *ctx)
@@ -447,6 +462,7 @@ static void rx_task(void *arg)
                 ctx->busy_gap_max_us = (uint32_t)(t0 - prev);
             }
             // One chunk from the next lane that holds frames.
+            sample_rx_clock(ctx);
             int n = mcpfd_stream_step(&ctx->stream, &hooks);
             int64_t t1 = esp_timer_get_time();
             if ((uint32_t)(t1 - t0) > ctx->step_max_us) {
@@ -490,6 +506,13 @@ static esp_err_t iface_init(can_interface_t *self)
     // Configure bit timing
     err = configure_bitrate(ctx);
     if (err != ESP_OK) return err;
+
+    err = write_reg32(ctx, MCP251XFD_TSCON,
+                      MCP251XFD_TBC_ENABLE | (ctx->osc_freq_hz / 1000000u - 1u));
+    if (err != ESP_OK) return err;
+    ctx->rx_clock = (mcp251xfd_rx_clock_t){0};
+    ctx->rx_clock_sample_due = 0;
+    sample_rx_clock(ctx);
 
     // Enable ISO CRC for CAN FD, use default protocol exception handling
     uint32_t con;
@@ -567,8 +590,8 @@ static esp_err_t loopback_self_test(mcp251xfd_ctx_t *ctx)
 
     // Read received frame
     read_reg32(ctx, REG_C1FIFOUA(1), &ua);
-    uint8_t rx[16];
-    spi_read_reg(ctx, RAM_BASE + ua, rx, 16);
+    uint8_t rx[MCPFD_RX_OBJ_SIZE];
+    spi_read_reg(ctx, RAM_BASE + ua, rx, sizeof(rx));
 
     uint32_t r0 = rx[0] | (rx[1] << 8) | (rx[2] << 16) | (rx[3] << 24);
     uint16_t sid = r0 & 0x7FF;
@@ -579,7 +602,7 @@ static esp_err_t loopback_self_test(mcp251xfd_ctx_t *ctx)
     fifocon |= FIFOCON_UINC;
     write_reg32(ctx, REG_C1FIFOCON(1), fifocon);
 
-    if (sid == 0x123 && dlc == 4 && rx[8] == 0xDE && rx[9] == 0xAD) {
+    if (sid == 0x123 && dlc == 4 && rx[12] == 0xDE && rx[13] == 0xAD) {
         ESP_LOGI(TAG, "Loopback self-test PASSED");
     } else {
         ESP_LOGE(TAG, "Internal loopback FAILED: unexpected data");
@@ -617,7 +640,7 @@ static esp_err_t loopback_self_test(mcp251xfd_ctx_t *ctx)
     if (fifosta & FIFOSTA_TFNRFNIF) {
         // External loopback OK - consume the frame
         read_reg32(ctx, REG_C1FIFOUA(1), &ua);
-        spi_read_reg(ctx, RAM_BASE + ua, rx, 16);
+        spi_read_reg(ctx, RAM_BASE + ua, rx, sizeof(rx));
 
         read_reg32(ctx, REG_C1FIFOCON(1), &fifocon);
         fifocon |= FIFOCON_UINC;
@@ -806,7 +829,7 @@ can_interface_t *mcp251xfd_create(const mcp251xfd_config_t *config)
         .sclk_io_num = config->pin_sclk,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 160, // chunked RX read: 2 cmd + 8 * 16 data, with margin
+        .max_transfer_sz = MCPFD_BLK_BUF_SIZE,
     };
 
     esp_err_t err = spi_bus_initialize(config->spi_host, &bus_cfg, SPI_DMA_CH_AUTO);

@@ -6,6 +6,7 @@
 // tools/test/run_can_host_test.sh (plain gcc, no ESP-IDF).
 
 #include "mcp251xfd_stream.h"
+#include "mcp251xfd_rx_clock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,10 +65,15 @@ static uint32_t reg32(const chip_t *c, int addr)
 }
 static int fifo_depth(const chip_t *c, int n) { return (int)((reg32(c, REG_FIFOCON(n)) >> 24) & 0x1F) + 1; }
 static bool fifo_is_tx(const chip_t *c, int n) { return (reg32(c, REG_FIFOCON(n)) >> 7) & 1; }
+static int fifo_size(const chip_t *c, int n)
+{
+    return (reg32(c, REG_FIFOCON(n)) & (1u << 5)) ? MCPFD_RX_OBJ_SIZE : MCPFD_TX_OBJ_SIZE;
+}
+
 static int fifo_base(const chip_t *c, int n)
 {
     int base = c->base_shift;
-    for (int i = 1; i < n; i++) base += fifo_depth(c, i) * 16;   // RAM follows the FIFO numbers
+    for (int i = 1; i < n; i++) base += fifo_depth(c, i) * fifo_size(c, i);   // RAM follows the FIFO numbers
     return base;
 }
 
@@ -105,7 +111,7 @@ static uint32_t fifo_sta(chip_t *c, int n, bool consume)
 static uint32_t fifo_ua(const chip_t *c, int n)
 {
     int idx = fifo_is_tx(c, n) ? c->head[n] : c->tail[n];
-    return (uint32_t)(fifo_base(c, n) + idx * 16);
+    return (uint32_t)(fifo_base(c, n) + idx * fifo_size(c, n));
 }
 
 static uint32_t rxif(const chip_t *c)
@@ -210,11 +216,12 @@ static int chip_bus_rx(chip_t *c, uint32_t id, const uint8_t *data, int dlc)
         int n = con & 0x1F;
         int depth = fifo_depth(c, n);
         if (c->count[n] == depth) { c->ovf[n] = true; return -1; }
-        uint8_t *o = &c->ram[fifo_base(c, n) + c->head[n] * 16];
-        memset(o, 0, 16);
+        uint8_t *o = &c->ram[fifo_base(c, n) + c->head[n] * fifo_size(c, n)];
+        memset(o, 0, MCPFD_RX_OBJ_SIZE);
         o[0] = (uint8_t)id; o[1] = (uint8_t)(id >> 8);
         o[4] = (uint8_t)dlc;
-        memcpy(o + 8, data, (size_t)(dlc > 8 ? 8 : dlc));
+        memcpy(o + 8, data, 4);
+        memcpy(o + 12, data, (size_t)(dlc > 8 ? 8 : dlc));
         c->head[n] = (c->head[n] + 1) % depth;
         c->count[n]++;
         return n;
@@ -274,13 +281,14 @@ static void rig_unlock(void *ctx)
     }
 }
 
-static void rig_deliver(void *ctx, const can_frame_t *f)
+static void rig_deliver(void *ctx, const can_frame_t *f, uint32_t counter)
 {
     rig_t *r = ctx;
     CHECK(r->lock_depth == 0);                 // delivery never holds the SPI lock
     CHECK(f->id < 2048 && f->dlc == 8);
     uint32_t seq = (uint32_t)f->data[0] | ((uint32_t)f->data[1] << 8) |
                    ((uint32_t)f->data[2] << 16) | ((uint32_t)f->data[3] << 24);
+    CHECK(counter == seq);
     CHECK(seq == r->got_seq[f->id]);           // in order, no loss, no duplicate
     CHECK(f->data[7] == (uint8_t)(f->id ^ 0x5A));
     r->got_seq[f->id] = seq + 1;
@@ -361,10 +369,10 @@ static void layout_matches_the_chip(void)
     }
     CHECK(fifo_base(&r.chip, MCPFD_FIFO_TX) == r.s.tx_base);
     const mcpfd_lane_t *last = &r.s.lane[MCPFD_LANES - 1];
-    CHECK(last->base + last->depth * MCPFD_OBJ_SIZE == MCPFD_RAM_SIZE);
+    CHECK(last->base + last->depth * MCPFD_RX_OBJ_SIZE <= MCPFD_RAM_SIZE);
     CHECK(MCPFD_LANE_DEPTH <= 32);                       // the chip's largest FIFO
     CHECK(fifo_is_tx(&r.chip, MCPFD_FIFO_TX) && fifo_depth(&r.chip, MCPFD_FIFO_TX) == MCPFD_TX_DEPTH);
-    CHECK(MCPFD_BLK_BUF_SIZE >= 2 + MCPFD_CHUNK * MCPFD_OBJ_SIZE && MCPFD_REG_BUF_SIZE >= 2 + MCPFD_OBJ_SIZE);
+    CHECK(MCPFD_BLK_BUF_SIZE >= 2 + MCPFD_CHUNK * MCPFD_RX_OBJ_SIZE && MCPFD_REG_BUF_SIZE >= 2 + MCPFD_TX_OBJ_SIZE);
 }
 
 static void every_id_is_received_in_its_lane(void)
@@ -431,7 +439,7 @@ static void long_random_stream_is_complete_and_ordered(void)
     // One lock never covers more than: RXIF + status + overflow clear + the
     // confirming status read + chunk read + one release per message.
     CHECK(r.max_xfers_per_lock <= 5 + MCPFD_CHUNK);
-    CHECK(r.chip.max_xfer_len <= 2 + MCPFD_CHUNK * MCPFD_OBJ_SIZE);
+    CHECK(r.chip.max_xfer_len <= 2 + MCPFD_CHUNK * MCPFD_RX_OBJ_SIZE);
     CHECK(r.chip.tx_count > 0 && r.s.stats.tx_frames > 0);
 }
 
@@ -463,16 +471,15 @@ static void full_fifo_and_wraparound(void)
     rig_init(&r);
     // Move the ring so the full FIFO wraps, then fill it exactly: head == tail
     // with the full flag set.
-    for (int i = 0; i < 13; i++) rig_inject(&r, 0x1F9);
+    for (int i = 0; i < MCPFD_CHUNK + 2; i++) rig_inject(&r, 0x1F9);
     rig_drain(&r);
     for (int i = 0; i < MCPFD_LANE_DEPTH; i++) CHECK(rig_inject(&r, 0x1F9) == FIFO_1F9);
     CHECK(r.chip.count[FIFO_1F9] == MCPFD_LANE_DEPTH);
-    CHECK(rig_step(&r) == MCPFD_CHUNK);             // tail 13: full chunks up to the end of the ring
-    CHECK(rig_step(&r) == MCPFD_CHUNK);
-    CHECK(rig_step(&r) == MCPFD_LANE_DEPTH - 13 - 2 * MCPFD_CHUNK);   // the short run that ends the ring
+    CHECK(rig_step(&r) == MCPFD_CHUNK);             // full chunk before the end of the ring
+    CHECK(rig_step(&r) == MCPFD_LANE_DEPTH - (MCPFD_CHUNK + 2) - MCPFD_CHUNK);   // the short run that ends the ring
     CHECK(rig_step(&r) == MCPFD_CHUNK);             // then full chunks from index 0
     rig_drain(&r);
-    CHECK(r.delivered == 13 + MCPFD_LANE_DEPTH);
+    CHECK(r.delivered == MCPFD_CHUNK + 2 + MCPFD_LANE_DEPTH);
     rig_check_all_delivered(&r);
     rig_check_clean(&r);
     CHECK(r.s.stats.rx_overflow[LANE_1F9] == 0);
@@ -589,7 +596,10 @@ static void transmit_encodes_frames(void)
     CHECK((t0 & 0x7FF) == (0x18DAF110u >> 18) && ((t0 >> 11) & 0x3FFFF) == (0x18DAF110u & 0x3FFFF));
     CHECK(o[4] == (1 | (1 << 4)));
     can_frame_t back;
-    mcpfd_stream_parse(o, &back);
+    uint8_t received[MCPFD_RX_OBJ_SIZE] = {0};
+    memcpy(received, o, 8);
+    memcpy(received + 12, o + 8, 8);
+    mcpfd_stream_parse(received, &back);
     CHECK(back.id == 0x18DAF110 && back.extended && back.dlc == 1 && back.data[0] == 0x3E);
 
     can_frame_t fd = { .id = 0x100, .dlc = 9 };
@@ -674,8 +684,20 @@ static void polls_the_receive_interrupt_register(void)
     CHECK(rig_step(&r) == 1);
 }
 
+static void controller_clock_wraps_and_maps_queued_frames(void)
+{
+    mcp251xfd_rx_clock_t clock = {0};
+    CHECK(mcp251xfd_rx_clock_time(&clock, 0) == 0);
+    mcp251xfd_rx_clock_sample(&clock, UINT32_MAX - 4, 99998, 100002);
+    CHECK(mcp251xfd_rx_clock_time(&clock, 5) == 100010);
+    mcp251xfd_rx_clock_sample(&clock, 15, 100018, 100022);
+    CHECK(mcp251xfd_rx_clock_time(&clock, UINT32_MAX - 4) == 100000);
+    CHECK(mcp251xfd_rx_clock_time(&clock, 5) == 100010);
+}
+
 int main(void)
 {
+    controller_clock_wraps_and_maps_queued_frames();
     layout_matches_the_chip();
     every_id_is_received_in_its_lane();
     accept_all_filter_for_the_self_test();

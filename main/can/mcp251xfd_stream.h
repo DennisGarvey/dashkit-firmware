@@ -39,9 +39,10 @@
 // while the others sat empty; these two split it evenly.
 #define MCPFD_LANE_SHIFT      4
 #define MCPFD_LANE_OF(id)     (((id) >> MCPFD_LANE_SHIFT) & 3)
-#define MCPFD_LANE_DEPTH      31
+#define MCPFD_LANE_DEPTH      24
 #define MCPFD_TX_DEPTH        4
-#define MCPFD_OBJ_SIZE        16
+#define MCPFD_TX_OBJ_SIZE     16
+#define MCPFD_RX_OBJ_SIZE     20
 #define MCPFD_RAM_SIZE        2048
 
 // Messages moved per SPI read. Bounds how long one step holds the SPI lock, so
@@ -53,7 +54,7 @@
 
 // Scratch buffer sizes the caller must provide.
 #define MCPFD_REG_BUF_SIZE    24                                   // 2 + 16, padded
-#define MCPFD_BLK_BUF_SIZE    (4 + MCPFD_CHUNK * MCPFD_OBJ_SIZE)   // 2 + chunk, padded
+#define MCPFD_BLK_BUF_SIZE    (4 + MCPFD_CHUNK * MCPFD_RX_OBJ_SIZE)   // 2 + chunk, padded
 
 // One full-duplex SPI transfer of `len` bytes with chip select held for the
 // whole transfer. `rx` may be NULL when the reply is not needed.
@@ -98,7 +99,7 @@ typedef struct {
 typedef struct {
     void (*lock)(void *ctx);
     void (*unlock)(void *ctx);
-    void (*deliver)(void *ctx, const can_frame_t *frame);
+    void (*deliver)(void *ctx, const can_frame_t *frame, uint32_t counter);
     void *ctx;
 } mcpfd_hooks_t;
 
