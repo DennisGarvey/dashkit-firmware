@@ -485,12 +485,10 @@ static void read_usb_requests(void)
         if (!sequence || (!repeat && !automatic && raw[1] != DK_TX_REQUEST)) continue;
         uint8_t result_type = automatic ? DK_TX_AUTO_RESULT :
                               (repeat ? DK_TX_REPEAT_RESULT : DK_TX_RESULT);
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
         if (raw[3] & 4) {
             write_tx_result(result_type, bus, sequence, DK_TX_REJECTED);
             continue;
         }
-#endif
         bool repeat_busy = s_repeat.sequence != 0;
         if (repeat_busy) {
             write_tx_result(result_type, bus, sequence,

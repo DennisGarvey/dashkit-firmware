@@ -24,7 +24,7 @@ if(CONFIG_DASHKIT_USB_CAPTURE)
     list(APPEND CAPTURE_SRCS "capture/usb_capture.c")
 endif()
 
-if(CONFIG_DASHKIT_USB_TX_CLASSIC)
+if(CONFIG_DASHKIT_USB_TX)
     list(APPEND CAPTURE_SRCS "can/mcp251xfd_classic_rx.c")
 endif()
 

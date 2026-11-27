@@ -22,10 +22,11 @@
 
 #define LANE_SHIFT      4
 #define TEF_BYTES       8
-#define TX_BYTES        72
+#define USB_TX_BYTES    72
+#define PASSIVE_TX_BYTES (4 * 16)
 #define LANE_BYTES      (MCP_CLASSIC_FIFO_DEPTH * MCP_CLASSIC_RX_BYTES)
 
-_Static_assert(TEF_BYTES + TX_BYTES + MCP_CLASSIC_FIFO_COUNT * LANE_BYTES <= 2048,
+_Static_assert(TEF_BYTES + USB_TX_BYTES + MCP_CLASSIC_FIFO_COUNT * LANE_BYTES <= 2048,
                "MCP251xfd FIFO layout exceeds controller RAM");
 _Static_assert(MCP_CLASSIC_CHUNK_FRAMES <= MCP_CLASSIC_FIFO_DEPTH / 2,
                "Receive bursts must fit within the half-full threshold");
@@ -74,6 +75,9 @@ static void deliver_frame(mcp251xfd_classic_rx_t *rx, const uint8_t *object)
 {
     const uint32_t id = read_le32(object);
     const uint32_t header = read_le32(object + 4);
+    // Passive mode can see an FD object. Its payload may be truncated in a
+    // Classic-sized FIFO, so leave it out of the Classic-only stream.
+    if (header & (1u << 7)) return;
     can_frame_t frame = {
         .id = id & 0x7ff,
         .dlc = (header & 15) > 8 ? 8 : header & 15,
@@ -94,7 +98,9 @@ static bool drain_lane(mcp251xfd_classic_rx_t *rx, unsigned lane)
     const uint32_t sta = read_le32(status);
     const uint32_t ua = read_le32(status + 4);
     // Controller RAM is allocated in FIFO number order, after the TEF.
-    const uint32_t base = TEF_BYTES + lane * LANE_BYTES + (lane ? TX_BYTES : 0);
+    const uint32_t start = rx->has_tx_event ? TEF_BYTES : 0;
+    const uint32_t tx_bytes = rx->has_tx_event ? USB_TX_BYTES : PASSIVE_TX_BYTES;
+    const uint32_t base = start + lane * LANE_BYTES + (lane ? tx_bytes : 0);
     if (ua < base || ua >= base + LANE_BYTES || ((ua - base) % MCP_CLASSIC_RX_BYTES) != 0) return false;
 
     if ((sta & FIFO_OVERFLOW) &&

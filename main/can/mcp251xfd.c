@@ -1,6 +1,6 @@
 #include "mcp251xfd_rx_clock.h"
 #include "mcp251xfd.h"
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
 #include "mcp251xfd_classic_rx.h"
 #endif
 #ifdef CONFIG_DASHKIT_USB_CAPTURE
@@ -13,7 +13,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <stdbool.h>
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
 #include <stdatomic.h>
 #endif
 #include <string.h>
@@ -154,7 +154,7 @@ typedef struct {
 #else
     _Alignas(4) uint8_t spi_tx[64];
 #endif
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
     mcp251xfd_classic_rx_t classic_rx;
     atomic_bool classic_rx_ready;
     _Alignas(4) uint8_t spi_rx[MCP_CLASSIC_CHUNK_BYTES];
@@ -401,7 +401,7 @@ static esp_err_t configure_bitrate(mcp251xfd_ctx_t *ctx)
     return ESP_OK;
 }
 
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
 static esp_err_t classic_read(void *io, uint16_t addr, uint8_t *data, size_t len)
 {
     return spi_read_reg(io, addr, data, len);
@@ -433,13 +433,14 @@ static void classic_overflow(void *io)
 
 static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
 {
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
     ctx->classic_rx = (mcp251xfd_classic_rx_t) {
         .io = ctx,
         .read = classic_read,
         .write = classic_write,
         .deliver = classic_deliver,
         .overflow = classic_overflow,
+        .has_tx_event = true,
     };
     // FIFO 2 remains single-slot TX. The Classic RX layout leaves space
     // for its 72-byte object and the 8-byte transmit event object.
@@ -529,7 +530,7 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 
 static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
 {
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
     if (!atomic_load(&ctx->classic_rx_ready)) return;
     // Give the other controller a scheduling opportunity between chunks.
     // Poll again immediately while frames remain on this controller.
@@ -921,7 +922,7 @@ static esp_err_t iface_start(can_interface_t *self)
     // Re-enter config mode to reset FIFOs after loopback tests
     set_mode(ctx, OPMODE_CONFIG);
 
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
     esp_err_t reset_err = mcp251xfd_classic_reset(&ctx->classic_rx);
     if (reset_err != ESP_OK) return reset_err;
 #else
@@ -942,10 +943,8 @@ static esp_err_t iface_start(can_interface_t *self)
     // (ACKs incoming frames and sends queued TX frames). Required for the
     // BLE CAN TX characteristic to actually put frames on the bus.
     // For passive monitoring only, change to OPMODE_LISTEN_ONLY.
-#if defined(CONFIG_DASHKIT_USB_TX_CLASSIC)
+#if defined(CONFIG_DASHKIT_USB_TX)
     esp_err_t err = set_mode(ctx, OPMODE_NORMAL_2_0);
-#elif defined(CONFIG_DASHKIT_USB_TX)
-    esp_err_t err = set_mode(ctx, OPMODE_NORMAL_FD);
 #elif defined(CONFIG_DASHKIT_USB_CAPTURE)
     esp_err_t err = set_mode(ctx, OPMODE_LISTEN_ONLY);
 #else
@@ -956,7 +955,7 @@ static esp_err_t iface_start(can_interface_t *self)
         return err;
     }
 
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
     atomic_store(&ctx->classic_rx_ready, true);
 #endif
     return ESP_OK;
@@ -966,7 +965,7 @@ static esp_err_t iface_stop(can_interface_t *self)
 {
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
     ctx->running = false;
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
     atomic_store(&ctx->classic_rx_ready, false);
 #endif
 
@@ -1029,7 +1028,7 @@ static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
 #if defined(CONFIG_DASHKIT_USB_CAPTURE) && !defined(CONFIG_DASHKIT_USB_TX)
     return ESP_ERR_NOT_SUPPORTED;
 #endif
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
     if (frame->fd || frame->brs || frame->dlc > 8) return ESP_ERR_NOT_SUPPORTED;
 #endif
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
@@ -1107,6 +1106,9 @@ can_interface_t *mcp251xfd_create(const mcp251xfd_config_t *config)
         return NULL;
     }
 
+#ifdef CONFIG_DASHKIT_USB_TX
+    atomic_init(&ctx->classic_rx_ready, false);
+#endif
     ctx->pin_int = config->pin_int;
     ctx->osc_freq_hz = config->osc_freq_hz;
     ctx->bitrate = config->bitrate;
@@ -1125,7 +1127,7 @@ can_interface_t *mcp251xfd_create(const mcp251xfd_config_t *config)
         .sclk_io_num = config->pin_sclk,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-#ifdef CONFIG_DASHKIT_USB_TX_CLASSIC
+#ifdef CONFIG_DASHKIT_USB_TX
         .max_transfer_sz = MCP_CLASSIC_CHUNK_BYTES + 4,
 #else
         .max_transfer_sz = 76,  // 8 header + 4 cmd + 64 data

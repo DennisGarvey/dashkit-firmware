@@ -21,6 +21,3 @@ backups/
 build-usb-tx/
 build-usb-tx.log
 sdkconfig.usb-tx.generated*
-
-build-usb-tx-classic/
-sdkconfig.usb-tx-classic.generated*

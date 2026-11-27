@@ -10,12 +10,13 @@ typedef struct {
     uint32_t registers[0x400 / 4];
     unsigned fifo, tail, waiting, delivered, overflow_count, releases_until_failure;
     unsigned reads, largest_read, released;
-    bool invalid_address, read_failure, overflow;
+    bool invalid_address, read_failure, overflow, has_tx_event, fd;
 } mock_t;
 
-static uint32_t fifo_base(unsigned fifo)
+static uint32_t fifo_base(const mock_t *m)
 {
-    return fifo == 1 ? 8 : 80 + (fifo - 2) * 480;
+    if (m->fifo == 1) return m->has_tx_event ? 8 : 0;
+    return (m->has_tx_event ? 80 : 64) + (m->fifo - 2) * 480;
 }
 
 static void put32(uint8_t *p, uint32_t v)
@@ -36,11 +37,11 @@ static esp_err_t read_bus(void *io, uint16_t addr, uint8_t *data, size_t len)
         // Deliberately bogus producer index. The flags still describe the FIFO.
         put32(data, 31u << 8 | (m->waiting != 0) | (m->waiting >= 12 ? 2 : 0) |
                         (m->waiting == 24 ? 4 : 0) | (m->overflow ? 8 : 0));
-        put32(data + 4, fifo_base(m->fifo) + 20 * m->tail + m->invalid_address);
+        put32(data + 4, fifo_base(m) + 20 * m->tail + m->invalid_address);
         return ESP_OK;
     }
 
-    assert(addr == 0x400 + fifo_base(m->fifo) + 20 * m->tail);
+    assert(addr == 0x400 + fifo_base(m) + 20 * m->tail);
     assert(len % 20 == 0 && len / 20 <= m->waiting && m->tail + len / 20 <= 24);
     if (m->read_failure) return ESP_FAIL;
     ++m->reads;
@@ -49,7 +50,7 @@ static esp_err_t read_bus(void *io, uint16_t addr, uint8_t *data, size_t len)
     for (unsigned i = 0; i < len / 20; ++i) {
         uint8_t *object = data + 20 * i;
         put32(object, 0x123 | (0x23456u << 11));
-        put32(object + 4, 0x18);
+        put32(object + 4, m->fd ? 0x98 : 0x18);
         put32(object + 8, 5000 + m->released + i);
         memset(object + 12, m->released + i, 8);
     }
@@ -89,11 +90,12 @@ static void overflow(void *io)
     ++((mock_t *)io)->overflow_count;
 }
 
-int main(void)
+static void test_layout(bool has_tx_event)
 {
-    mock_t m = {.fifo = 1, .tail = 22, .waiting = 24, .overflow = true, .releases_until_failure = 100};
+    mock_t m = {.fifo = 1, .tail = 22, .waiting = 24, .overflow = true, .releases_until_failure = 100,
+                .has_tx_event = has_tx_event};
     mcp251xfd_classic_rx_t rx = {.io = &m, .read = read_bus, .write = write_bus,
-                               .deliver = deliver, .overflow = overflow};
+                               .deliver = deliver, .overflow = overflow, .has_tx_event = has_tx_event};
     assert(mcp251xfd_classic_configure(&rx) == ESP_OK);
     assert(m.registers[0x1d0 / 4] == 0x85848381u);
     for (unsigned lane = 0; lane < 4; ++lane) {
@@ -117,5 +119,15 @@ int main(void)
     m.releases_until_failure = 100;
     while (mcp251xfd_classic_drain(&rx)) {}
     assert(m.delivered == 24 && !m.waiting && m.largest_read == 160);
+    m.waiting = 1;
+    m.fd = true;
+    assert(mcp251xfd_classic_drain(&rx));
+    assert(m.delivered == 24 && !m.waiting);
+}
+
+int main(void)
+{
+    test_layout(false);
+    test_layout(true);
     puts("Classic RX: layout, wrap, invalid address, SPI read and release failures, payload and timestamp passed");
 }

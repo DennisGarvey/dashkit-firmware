@@ -16,6 +16,7 @@ typedef struct {
     esp_err_t (*write)(void *io, uint16_t addr, uint32_t value);
     void (*deliver)(void *io, const can_frame_t *frame, uint32_t counter);
     void (*overflow)(void *io);
+    bool has_tx_event;
     uint8_t next_lane;
 } mcp251xfd_classic_rx_t;
 

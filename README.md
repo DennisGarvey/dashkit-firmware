@@ -132,20 +132,11 @@ FLASH_BUILD=build-capture
 ```
 
 **USB transmission** streams both buses and accepts manual transmit requests
-over USB. Both controllers enter active CAN FD mode at startup.
+over USB. Both controllers enter active Classic CAN mode at startup.
 
 ```bash
 ./tools/build_capture.sh --usb-tx
 FLASH_BUILD=build-usb-tx
-```
-
-**Classic CAN USB transmit** uses four 24-frame receive FIFOs per controller.
-It supports 8-byte Classic CAN frames on both buses and retains USB transmit
-and feedback. Use it on networks that carry only Classic CAN.
-
-```bash
-./tools/build_capture.sh --usb-tx-classic
-FLASH_BUILD=build-usb-tx-classic
 ```
 
 #### 2. Prepare the adapter
@@ -228,8 +219,9 @@ Host protocol tests:
 
 Run `./tools/build_capture.sh --usb-tx` to build
 `build-usb-tx/dashkit-firmware.bin`. This profile runs both controllers in
-active CAN FD mode and starts acknowledging frames at startup. Use it on an
-isolated CAN network.
+active Classic CAN mode and starts acknowledging frames at startup. Each
+controller uses four 24-frame receive FIFOs and supports 8-byte payloads.
+Use transmit controls on an isolated CAN network.
 
 In Cabana, open **Custom USB Serial**, then choose **Tools → Send Frame**.
 Select a DBC message to prefill its ID and payload length, or enter a custom ID
