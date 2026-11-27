@@ -2,8 +2,74 @@
 #include <stdio.h>
 #include "capture_protocol.h"
 
+static inline uint16_t reference_crc(const uint8_t *p, size_t n)
+{
+    uint16_t crc = 0xffff;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= (uint16_t)p[i] << 8;
+        for (int bit = 0; bit < 8; bit++)
+            crc = (uint16_t)((crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0));
+    }
+    return crc;
+}
+
+/* Appends CRC and COBS-encodes a payload of at most DK_MAX_RAW-2 bytes. */
+static inline size_t reference_encode(uint8_t *raw, size_t n, uint8_t *wire)
+{
+    if (n > DK_MAX_RAW - 2) return 0;
+    if ((raw[1] == DK_TX_REPEAT || raw[1] == DK_TX_AUTO) &&
+        (n < 25 || raw[24] > 64 ||
+         (n != (size_t)(25 + 2 * raw[24] + ((raw[3] & DK_TX_INCREMENT_COUNTER) ? 3 : 0) +
+                         ((raw[3] & DK_TX_RECALCULATE_CHECKSUM) ? 1 : 0)) &&
+          n != (size_t)(25 + 3 * raw[24] + ((raw[3] & DK_TX_INCREMENT_COUNTER) ? 3 : 0) +
+                         ((raw[3] & DK_TX_RECALCULATE_CHECKSUM) ? 1 : 0))))) return 0;
+    dk_put(raw + n, reference_crc(raw, n), 2);
+    n += 2;
+    size_t code_at = 0, out = 1;
+    uint8_t code = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (raw[i] == 0) {
+            wire[code_at] = code;
+            code_at = out++;
+            code = 1;
+        } else {
+            wire[out++] = raw[i];
+            code++;
+        }
+    }
+    wire[code_at] = code;
+    wire[out++] = 0;
+    if (raw[1] == DK_TX_REPEAT || raw[1] == DK_TX_AUTO) {
+        uint32_t hz = dk_get(raw + 12, 4), duration = dk_get(raw + 16, 4);
+        if (!dk_get(raw + 8, 4) ||
+            (raw[1] == DK_TX_REPEAT ? (!hz || hz > DK_TX_MAX_HZ) : hz != 0) ||
+            duration < DK_TX_MIN_DURATION_MS || duration > DK_TX_MAX_DURATION_MS) return 0;
+    }
+    return out;
+}
+
+static void check_wire_compatibility(void)
+{
+    uint32_t state = 0x12345678;
+    for (size_t len = 0; len <= DK_MAX_RAW - 2; ++len) {
+        for (unsigned pattern = 0; pattern < 32; ++pattern) {
+            uint8_t raw[DK_MAX_RAW] = {0}, reference_raw[DK_MAX_RAW] = {0};
+            uint8_t wire[DK_MAX_WIRE], reference_wire[DK_MAX_WIRE];
+            for (size_t i = 0; i < len; ++i) {
+                state = state * 1664525u + 1013904223u;
+                raw[i] = pattern == 0 ? 0 : pattern == 1 ? 0xff : (uint8_t)(state >> 24);
+            }
+            memcpy(reference_raw, raw, len);
+            const size_t encoded = dk_encode(raw, len, wire);
+            assert(encoded == reference_encode(reference_raw, len, reference_wire));
+            assert(memcmp(wire, reference_wire, encoded) == 0);
+        }
+    }
+}
+
 int main(void)
 {
+    check_wire_compatibility();
     assert(dk_crc((const uint8_t *)"123456789", 9) == 0x29b1);
     uint8_t wanted[] = {0xa5, 0x0f}, actual[] = {0x3c, 0xf0}, mask[] = {0xf0, 0x0f};
     assert(dk_merge_masked(wanted, actual, mask, 2));
