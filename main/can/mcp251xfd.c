@@ -1,3 +1,4 @@
+#include "mcp251xfd_rx_clock.h"
 #include "mcp251xfd.h"
 #ifdef CONFIG_DASHKIT_USB_CAPTURE
 #include "usb_capture.h"
@@ -94,7 +95,7 @@ static const char *TAG = "mcp251xfd";
 #define TEFSTA_NOT_EMPTY   (1 << 0)
 
 #define RX_FIFO_OBJECTS    24
-#define RX_OBJECT_BYTES    72
+#define RX_OBJECT_BYTES    76
 #ifdef CONFIG_DASHKIT_USB_TX
 #define RX_FIFO_BASE       8  // One untimestamped transmit event occupies 8 bytes.
 #else
@@ -149,6 +150,8 @@ typedef struct {
 #endif
     _Alignas(4) uint8_t spi_rx[64];
 #endif
+    mcp251xfd_rx_clock_t rx_clock;
+    int64_t rx_clock_sample_due;
 } mcp251xfd_ctx_t;
 
 // ---------------------------------------------------------------------------
@@ -251,7 +254,7 @@ static esp_err_t read_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t *val)
     uint8_t d[4];
     esp_err_t err = spi_read_reg(ctx, addr, d, 4);
     if (err == ESP_OK) {
-        *val = d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24);
+        *val = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
     }
     return err;
 }
@@ -317,6 +320,21 @@ static esp_err_t set_mode(mcp251xfd_ctx_t *ctx, uint8_t mode)
     ESP_LOGE(TAG, "Failed to enter mode 0x%02x", mode);
     return ESP_ERR_TIMEOUT;
 }
+
+
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+static void sample_rx_clock(mcp251xfd_ctx_t *ctx)
+{
+    const int64_t before = esp_timer_get_time();
+    if (before < ctx->rx_clock_sample_due) return;
+    ctx->rx_clock_sample_due = before + 1000000;
+    uint32_t counter;
+    if (read_reg32(ctx, MCP251XFD_TBC, &counter) == ESP_OK) {
+        mcp251xfd_rx_clock_sample(&ctx->rx_clock, counter, before, esp_timer_get_time());
+    }
+}
+
+#endif
 
 static esp_err_t configure_bitrate(mcp251xfd_ctx_t *ctx)
 {
@@ -388,6 +406,7 @@ static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
                           FIFOCON_TFNRFNIE;               // Not-empty interrupt
 #endif
 #ifdef CONFIG_DASHKIT_USB_CAPTURE
+    rxfifo_con |= MCP251XFD_RX_TIMESTAMP_ENABLE;
     ctx->rx_fifo_config = rxfifo_con;
 #endif
     esp_err_t err = write_reg32(ctx, REG_C1FIFOCON(1), rxfifo_con);
@@ -454,8 +473,13 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
 {
 #ifdef CONFIG_DASHKIT_USB_CAPTURE
+    const size_t payload_offset = 12;
+    uint8_t msg[20];
     uint32_t ua;
     if (read_reg32(ctx, REG_C1FIFOUA(1), &ua) != ESP_OK) return;
+#else
+    const size_t payload_offset = 8;
+    uint8_t msg[16];
 #endif
     while (true) {
         // Check FIFO 1 status
@@ -482,9 +506,7 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
         read_reg32(ctx, REG_C1FIFOUA(1), &ua);
 #endif
 
-        // Read message object from RAM (8 + 8 bytes for header + data)
-        uint8_t msg[16];
-        if (spi_read_reg(ctx, RAM_BASE + ua, msg, 16) != ESP_OK) return;
+        if (spi_read_reg(ctx, RAM_BASE + ua, msg, sizeof(msg)) != ESP_OK) return;
 
         // Parse message object
         uint32_t r0 = msg[0] | (msg[1] << 8) | (msg[2] << 16) | (msg[3] << 24);
@@ -493,6 +515,12 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
         can_tagged_frame_t tagged;
         memset(&tagged, 0, sizeof(tagged));
         tagged.bus_id = ctx->bus_id;
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+        sample_rx_clock(ctx);
+        const uint32_t counter = (uint32_t)msg[8] | ((uint32_t)msg[9] << 8) |
+                                 ((uint32_t)msg[10] << 16) | ((uint32_t)msg[11] << 24);
+        tagged.capture_timestamp_us = mcp251xfd_rx_clock_time(&ctx->rx_clock, counter);
+#endif
 
         // SID is in bits [10:0]
         tagged.frame.id = r0 & 0x7FF;
@@ -511,10 +539,10 @@ static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
         if (data_len > 8) {
             // For CAN FD frames > 8 bytes, read remaining data
             uint8_t extra[64];
-            if (spi_read_reg(ctx, RAM_BASE + ua + 8, extra, data_len) != ESP_OK) return;
+            if (spi_read_reg(ctx, RAM_BASE + ua + payload_offset, extra, data_len) != ESP_OK) return;
             memcpy(tagged.frame.data, extra, data_len);
         } else {
-            memcpy(tagged.frame.data, &msg[8], data_len);
+            memcpy(tagged.frame.data, &msg[payload_offset], data_len);
         }
 
         // Increment FIFO head pointer
@@ -618,6 +646,14 @@ static esp_err_t iface_init(can_interface_t *self)
     // Configure bit timing
     err = configure_bitrate(ctx);
     if (err != ESP_OK) return err;
+#ifdef CONFIG_DASHKIT_USB_CAPTURE
+    err = write_reg32(ctx, MCP251XFD_TSCON,
+                      MCP251XFD_TBC_ENABLE | (ctx->osc_freq_hz / 1000000u - 1u));
+    if (err != ESP_OK) return err;
+    ctx->rx_clock = (mcp251xfd_rx_clock_t){0};
+    ctx->rx_clock_sample_due = 0;
+    sample_rx_clock(ctx);
+#endif
 
     // Enable ISO CRC for CAN FD, use default protocol exception handling
     uint32_t con;
