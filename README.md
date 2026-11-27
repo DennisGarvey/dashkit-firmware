@@ -2,6 +2,15 @@
 
 Run `zmq_bridge.py` on the machine connected to DashKit over USB. It publishes received CAN frames on the standard Cabana ZMQ `can` endpoint, preserving the bus number, CAN ID, and payload. Cabana uses its built-in ZMQ input. Firmware logs and device metrics are displayed in the bridge terminal.
 
+The bridge buffers frames for at least 10 ms while streaming. By default, it
+publishes strictly increasing timestamps for upstream Cabana. A tied or late
+timestamp is moved just past the last published frame. The bridge reports late
+arrivals in its terminal output.
+
+With a Cabana build that supports out-of-order live frames, pass
+`--preserve-late-timestamps` to publish the original timestamps, including ties
+and late arrivals.
+
 ## Requirements
 
 - Python 3 with `pyserial`, `pycapnp`, and `pyzmq`.

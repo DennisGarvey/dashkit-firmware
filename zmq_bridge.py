@@ -151,35 +151,38 @@ def decode(wire):
     return kind, bus, boot, sequence, timestamp, (address, b'' if rtr else bytes(raw[25:-2]))
 
 
-REORDER_NS = 3_000_000
+REORDER_NS = 10_000_000
 
 
 class FrameReorder:
-    def __init__(self):
+    def __init__(self, preserve_late_timestamps=False):
         self.pending = []
         self.order = 0
-        self.newest_ns = 0
-        self.last_ns = 0
         self.last_source_ns = 0
+        self.last_published_ns = 0
         self.late = 0
+        self.preserve_late_timestamps = preserve_late_timestamps
 
     def push(self, frame, now_ns):
         timestamp, *_ = frame
-        self.newest_ns = max(self.newest_ns, timestamp)
         heappush(self.pending, (timestamp, self.order, now_ns + REORDER_NS, frame))
         self.order += 1
 
     def ready(self, now_ns, flush=False):
         while self.pending:
             timestamp, _, deadline, frame = self.pending[0]
-            if not flush and now_ns < deadline and self.newest_ns - timestamp < REORDER_NS:
+            if not flush and now_ns < deadline:
                 break
             heappop(self.pending)
             if timestamp < self.last_source_ns:
                 self.late += 1
             self.last_source_ns = max(self.last_source_ns, timestamp)
-            self.last_ns = max(timestamp, self.last_ns + 1)
-            yield self.last_ns, *frame[1:]
+            if self.preserve_late_timestamps:
+                yield frame
+            else:
+                # Upstream live playback advances strictly beyond its cursor.
+                self.last_published_ns = max(timestamp, self.last_published_ns + 1)
+                yield self.last_published_ns, *frame[1:]
 
 
 class UsbStream:
@@ -664,7 +667,7 @@ def run(args):
         schema.write_text(CAN_SCHEMA, encoding='utf-8')
         event_type = capnp.load(str(schema)).Event
     stream = UsbStream()
-    reorder = FrameReorder()
+    reorder = FrameReorder(preserve_late_timestamps=args.preserve_late_timestamps)
     with zmq.Context() as context, context.socket(zmq.PUB) as publisher:
         publisher.linger = 0
         try:
@@ -747,6 +750,8 @@ def main():
     binding.add_argument('--tailscale', action='store_true',
                          help="Listen on this host's Tailscale IPv4 address")
     parser.add_argument('--baud', type=int, default=8000000, help='Serial line rate (default: %(default)s)')
+    parser.add_argument('--preserve-late-timestamps', action='store_true',
+                        help='Keep original timestamps for Cabana builds that support out-of-order live frames')
     parser.add_argument('--no-status', action='store_true',
                         help='Print logs and device metrics without the interactive status bar')
     args = parser.parse_args()
