@@ -1,4 +1,4 @@
-// Minimal esp_err.h shim for host-side unit tests of the DBC engine.
+// Minimal esp_err.h shim for host-side CAN receive tests.
 #pragma once
 #include <stdint.h>
 

@@ -1,68 +1,22 @@
 #include "can_manager.h"
-#include "can_filter.h"
-#ifdef CONFIG_DASHKIT_USB_CAPTURE
 #include "usb_capture.h"
-#endif
-#include "automation_manager.h"
-#include "vehicle_control.h"
-#include "dbc.h"
 #include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include <stdbool.h>
-#include <string.h>
 
 static const char *TAG = "can_mgr";
 
-// Sized to absorb a few hundred ms of CAN traffic if BLE briefly stalls.
-// At ~335 fps (realistic Tesla rates) this is ~750ms of headroom.
-#define RX_QUEUE_DEPTH  256
-
 static can_interface_t *s_interfaces[CAN_MANAGER_MAX_INTERFACES];
 static int              s_iface_count = 0;
-static QueueHandle_t    s_rx_queue = NULL;
 
 // Callback invoked by CAN drivers from their RX tasks
 static void on_frame_received(const can_tagged_frame_t *frame, void *user_ctx)
 {
     (void)user_ctx;
-#ifdef CONFIG_DASHKIT_USB_CAPTURE
     usb_capture_submit(frame);
-#else
-    if (!s_rx_queue) return;
-    // Feed the DBC value cache first so automation on_frame handlers (which read
-    // signals via can_get) observe this frame's current contents.
-    dbc_observe_frame(frame);
-    // Automations run before the BLE filter so they see all raw traffic.
-    automation_manager_on_frame(frame);
-    vehicle_control_on_frame(frame);
-    // Drop non-matching frames at the source so the bridge task's batching
-    // timeout reflects "no more *matching* frames" rather than "no more
-    // frames at all". This avoids holding onto a matching frame while we
-    // wait through a flood of unrelated traffic.
-    if (!can_filter_should_forward(frame->bus_id, frame->frame.id)) return;
-
-    can_tagged_frame_t stamped = *frame;
-    stamped.timestamp_us = (uint32_t)esp_timer_get_time();
-    // Drop frame if queue is full rather than blocking the driver
-    xQueueSend(s_rx_queue, &stamped, 0);
-#endif
 }
 
 esp_err_t can_manager_init(void)
 {
-#ifdef CONFIG_DASHKIT_USB_CAPTURE
     return usb_capture_init();
-#else
-    s_rx_queue = xQueueCreate(RX_QUEUE_DEPTH, sizeof(can_tagged_frame_t));
-    if (!s_rx_queue) {
-        return ESP_ERR_NO_MEM;
-    }
-    s_iface_count = 0;
-    ESP_LOGI(TAG, "CAN manager initialized (queue depth=%d)", RX_QUEUE_DEPTH);
-    return ESP_OK;
-#endif
 }
 
 esp_err_t can_manager_add_interface(can_interface_t *iface)
@@ -99,43 +53,4 @@ esp_err_t can_manager_stop(void)
         s_interfaces[i]->stop(s_interfaces[i]);
     }
     return ESP_OK;
-}
-
-esp_err_t can_manager_receive(can_tagged_frame_t *frame, uint32_t timeout_ms)
-{
-    if (!s_rx_queue) return ESP_ERR_INVALID_STATE;
-    if (xQueueReceive(s_rx_queue, frame, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-        return ESP_OK;
-    }
-    return ESP_ERR_TIMEOUT;
-}
-
-esp_err_t can_manager_send(uint8_t bus_id, const can_frame_t *frame)
-{
-#ifdef CONFIG_DASHKIT_USB_CAPTURE
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
-    if (!frame) return ESP_ERR_INVALID_ARG;
-    for (int i = 0; i < s_iface_count; i++) {
-        if (s_interfaces[i]->bus_id == bus_id) {
-            if (!s_interfaces[i]->send) return ESP_ERR_NOT_SUPPORTED;
-            return s_interfaces[i]->send(s_interfaces[i], frame);
-        }
-    }
-    ESP_LOGW(TAG, "send: no interface for bus_id=%d", bus_id);
-    return ESP_ERR_NOT_FOUND;
-}
-
-esp_err_t can_manager_inject(const can_tagged_frame_t *frame)
-{
-    if (!s_rx_queue) return ESP_ERR_INVALID_STATE;
-    if (!can_filter_should_forward(frame->bus_id, frame->frame.id)) {
-        return ESP_OK;  // Silently dropped by filter
-    }
-    can_tagged_frame_t stamped = *frame;
-    stamped.timestamp_us = (uint32_t)esp_timer_get_time();
-    if (xQueueSend(s_rx_queue, &stamped, 0) == pdTRUE) {
-        return ESP_OK;
-    }
-    return ESP_ERR_NO_MEM;
 }
