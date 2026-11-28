@@ -236,5 +236,8 @@ int main(void)
     dk_put(raw + 36, 1234, 4);
     assert(dk_decode(wire, dk_encode(raw, DK_TX_LATENCY_SIZE, wire) - 1, decoded) == DK_TX_LATENCY_SIZE + 2);
     assert(dk_get(decoded + 36, 4) == 1234);
+    dk_put(raw + 108, 5678, 4);
+    assert(dk_decode(wire, dk_encode(raw, DK_TX_LATENCY_PEAK_SIZE, wire) - 1, decoded) == DK_TX_LATENCY_PEAK_SIZE + 2);
+    assert(dk_get(decoded + 108, 4) == 5678);
     puts("Capture protocol: frame roundtrips, corruption, masked timed modes, status, and truncation passed");
 }

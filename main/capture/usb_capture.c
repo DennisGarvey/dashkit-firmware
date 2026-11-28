@@ -99,7 +99,7 @@ static struct {
     uint64_t total[7];
     uint32_t max[7], count, timeouts;
     uint64_t tx_total, rx_to_tx_total;
-    uint32_t rx_to_tx_count;
+    uint32_t rx_to_tx_count, rx_to_tx_max;
     uint32_t tx_count, tx_max, arbitration_losses;
 } s_tx_latency[2];
 
@@ -423,7 +423,9 @@ static void service_tx_feedback(successful_tx_report_t *report)
         ++s_tx_latency[bus].tx_count;
         if (s_pending_tx.trigger_rx_us > 0 &&
             diagnostics.tx_timestamp_us >= (uint64_t)s_pending_tx.trigger_rx_us) {
-            s_tx_latency[bus].rx_to_tx_total += diagnostics.tx_timestamp_us - s_pending_tx.trigger_rx_us;
+            const uint32_t rx_to_tx = diagnostics.tx_timestamp_us - s_pending_tx.trigger_rx_us;
+            s_tx_latency[bus].rx_to_tx_total += rx_to_tx;
+            if (rx_to_tx > s_tx_latency[bus].rx_to_tx_max) s_tx_latency[bus].rx_to_tx_max = rx_to_tx;
             ++s_tx_latency[bus].rx_to_tx_count;
         }
     }
@@ -738,7 +740,8 @@ static void write_tx_latency(uint8_t bus, int64_t now)
         dk_put(raw + 92 + 8 * i, count ? s_tx_latency[bus].total[5 + i] / count : 0, 4);
         dk_put(raw + 96 + 8 * i, s_tx_latency[bus].max[5 + i], 4);
     }
-    write_record(raw, DK_TX_LATENCY_SIZE);
+    dk_put(raw + 108, s_tx_latency[bus].rx_to_tx_max, 4);
+    write_record(raw, DK_TX_LATENCY_PEAK_SIZE);
     memset(&s_tx_latency[bus], 0, sizeof(s_tx_latency[bus]));
 }
 
