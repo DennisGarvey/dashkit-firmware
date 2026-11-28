@@ -219,7 +219,8 @@ types 8 and 10. The current firmware announces readiness using type 3.
 
 The bus field identifies the physical bus. Flags and sequence are zero,
 and the timestamp marks the end of the reporting interval. Decoded length
-is 110 bytes including CRC. The firmware emits this record when the
+is 114 bytes including CRC, or 110 bytes without the paired RX-to-TX peak.
+The firmware emits this record when the
 interval has an RX-triggered request, a timestamped success, or an
 arbitration-only loss. The fields below are interval statistics.
 
@@ -245,6 +246,7 @@ arbitration-only loss. The fields below are interval statistics.
   trigger's own FIFO.
 - Bytes 100, 104: mean and peak of the frames delivered ahead from
   other FIFOs.
+- Byte 108: peak time for the paired RX-to-TX samples (when present).
 
 Each listed byte offset is the start of a little-endian `u32`. Durations
 are in microseconds. Means are truncated to integers, and a timing group
