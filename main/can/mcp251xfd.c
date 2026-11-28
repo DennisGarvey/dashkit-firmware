@@ -24,7 +24,6 @@ static const char *TAG = "mcp251xfd";
 #define REG_C1TEFSTA    0x044
 #define REG_C1FIFOCON(n)  (0x05C + ((n) - 1) * 12)
 #define REG_C1FIFOSTA(n)  (0x060 + ((n) - 1) * 12)
-#define REG_C1FIFOUA(n)   (0x064 + ((n) - 1) * 12)
 #define REG_C1TREC      0x034
 #define REG_C1BDIAG0    0x038
 #define REG_C1BDIAG1    0x03C
@@ -53,7 +52,6 @@ static const char *TAG = "mcp251xfd";
 
 // C1INT bits
 #define C1INT_RXIE          (1 << 17)
-#define C1INT_RXIF          (1 << 1)
 #define C1INT_TEFIE         (1 << 20)
 #define C1INT_TEFIF         (1 << 4)
 #define C1INT_TXATIE        (1 << 26)
@@ -67,7 +65,10 @@ static const char *TAG = "mcp251xfd";
 #define FIFOCON_FRESET      (1 << 10)
 #define FIFOCON_TXATIE      (1 << 4)
 #define TEFCON_TEFNEIE      (1 << 0)
+#define TEFCON_TEFTSEN      (1 << 5)
+#define TEFCON_CONFIG       (TEFCON_TEFNEIE | TEFCON_TEFTSEN)
 #define FIFOCON_PLSIZE_SHIFT 29
+#define TX_FIFO_CONFIG      ((7u << FIFOCON_PLSIZE_SHIFT) | FIFOCON_TXEN | FIFOCON_TXATIE)
 
 // FIFO status bits
 #define FIFOSTA_TFNRFNIF    (1 << 0)   // Not empty (RX) / not full (TX)
@@ -116,7 +117,10 @@ typedef struct {
     atomic_bool classic_rx_ready;
     _Alignas(4) uint8_t spi_rx[MCP_CLASSIC_CHUNK_BYTES];
     mcp251xfd_rx_clock_t rx_clock;
+    portMUX_TYPE rx_clock_lock;
     int64_t rx_clock_sample_due;
+    int64_t rx_task_wake_us;
+    bool rx_task_timeout;
 } mcp251xfd_ctx_t;
 
 // ---------------------------------------------------------------------------
@@ -162,13 +166,19 @@ static esp_err_t write_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t val)
     return spi_write_reg(ctx, addr, d, 4);
 }
 
+static uint32_t read_le32(const uint8_t *data)
+{
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
 static esp_err_t read_reg32(mcp251xfd_ctx_t *ctx, uint16_t addr, uint32_t *val)
 {
     *val = 0;
     uint8_t d[4];
     esp_err_t err = spi_read_reg(ctx, addr, d, 4);
     if (err == ESP_OK) {
-        *val = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+        *val = read_le32(d);
     }
     return err;
 }
@@ -233,7 +243,10 @@ static void sample_rx_clock(mcp251xfd_ctx_t *ctx)
     ctx->rx_clock_sample_due = before + 1000000;
     uint32_t counter;
     if (read_reg32(ctx, MCP251XFD_TBC, &counter) == ESP_OK) {
-        mcp251xfd_rx_clock_sample(&ctx->rx_clock, counter, before, esp_timer_get_time());
+        const int64_t after = esp_timer_get_time();
+        portENTER_CRITICAL(&ctx->rx_clock_lock);
+        mcp251xfd_rx_clock_sample(&ctx->rx_clock, counter, before, after);
+        portEXIT_CRITICAL(&ctx->rx_clock_lock);
     }
 }
 
@@ -300,7 +313,7 @@ static esp_err_t classic_write(void *io, uint16_t addr, uint32_t value)
     return write_reg32(io, addr, value);
 }
 
-static void classic_deliver(void *io, const can_frame_t *frame, uint32_t counter)
+static void classic_deliver(void *io, const can_frame_t *frame, uint32_t counter, uint8_t fifo)
 {
     mcp251xfd_ctx_t *ctx = io;
     if (!ctx->rx_cb) return;
@@ -308,6 +321,9 @@ static void classic_deliver(void *io, const can_frame_t *frame, uint32_t counter
         .frame = *frame,
         .bus_id = ctx->bus_id,
         .capture_timestamp_us = mcp251xfd_rx_clock_time(&ctx->rx_clock, counter),
+        .rx_task_wake_us = ctx->rx_task_wake_us,
+        .rx_task_timeout = ctx->rx_task_timeout,
+        .rx_fifo = fifo,
     };
     ctx->rx_cb(&tagged, ctx->rx_cb_ctx);
 }
@@ -329,9 +345,8 @@ static esp_err_t configure_fifos(mcp251xfd_ctx_t *ctx)
         .has_tx_event = true,
     };
     // FIFO 2 remains single-slot TX. The Classic RX layout leaves space
-    // for its 72-byte object and the 8-byte transmit event object.
-    esp_err_t err = write_reg32(ctx, REG_C1FIFOCON(2),
-                                (7u << FIFOCON_PLSIZE_SHIFT) | FIFOCON_TXEN | FIFOCON_TXATIE);
+    // for its 72-byte object and the 12-byte timestamped transmit event object.
+    esp_err_t err = write_reg32(ctx, REG_C1FIFOCON(2), TX_FIFO_CONFIG);
     return err == ESP_OK ? mcp251xfd_classic_configure(&ctx->classic_rx) : err;
 }
 
@@ -348,15 +363,19 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
     }
 }
 
-static void read_rx_fifo(mcp251xfd_ctx_t *ctx)
+static void read_rx_fifo(mcp251xfd_ctx_t *ctx, uint32_t pending)
 {
-    if (!atomic_load(&ctx->classic_rx_ready)) return;
+    if (!atomic_load(&ctx->classic_rx_ready) || !ctx->running ||
+        !mcp251xfd_classic_drain_pending(&ctx->classic_rx, usb_capture_automatic_sid(ctx->bus_id), pending))
+        return;
+
     // Give the other controller a scheduling opportunity between chunks.
     // Poll again immediately while frames remain on this controller.
-    while (ctx->running && mcp251xfd_classic_drain(&ctx->classic_rx)) {
+    do {
         sample_rx_clock(ctx);
         taskYIELD();
-    }
+    } while (ctx->running &&
+             mcp251xfd_classic_drain(&ctx->classic_rx, usb_capture_automatic_sid(ctx->bus_id)));
 }
 
 static void rx_task(void *arg)
@@ -371,16 +390,20 @@ static void rx_task(void *arg)
         // Fall through every 5 ms anyway as a safety net so we still drain the
         // FIFO if an interrupt is ever missed (e.g. semaphore lost during init,
         // or INT line already low when we enabled the IRQ).
-        xSemaphoreTake(ctx->int_sem, pdMS_TO_TICKS(5));
+        ctx->rx_task_timeout = xSemaphoreTake(ctx->int_sem, pdMS_TO_TICKS(5)) != pdTRUE;
+        ctx->rx_task_wake_us = esp_timer_get_time();
 
         // INT is level-sensitive on the MCP2518FD: it stays asserted as long
         // as RXIF is set, so we drain the whole FIFO in one go. Reading the
         // FIFO clears RXIF, which releases INT.
-        uint32_t intflag;
-        read_reg32(ctx, REG_C1INT, &intflag);
-        if (intflag & (C1INT_TEFIF | C1INT_TXATIF)) usb_capture_notify_tx_event();
-        if (intflag & C1INT_RXIF) {
-            read_rx_fifo(ctx);
+        // CiRXIF immediately follows CiINT, so fetch the pending FIFO mask
+        // in the same SPI transaction for the first drain pass.
+        uint8_t flags[8];
+        if (spi_read_reg(ctx, REG_C1INT, flags, sizeof(flags)) == ESP_OK) {
+            const uint32_t intflag = read_le32(flags);
+            if (intflag & (C1INT_TEFIF | C1INT_TXATIF)) usb_capture_notify_tx_event();
+            const uint32_t pending = read_le32(flags + 4);
+            if (pending) read_rx_fifo(ctx, pending);
         }
 
 #ifdef CONFIG_DASHKIT_DEBUG_LOG
@@ -442,7 +465,7 @@ static esp_err_t iface_init(can_interface_t *self)
     if (err != ESP_OK) return err;
 
     // One completion slot, without controller timestamps.
-    err = write_reg32(ctx, REG_C1TEFCON, TEFCON_TEFNEIE);
+    err = write_reg32(ctx, REG_C1TEFCON, TEFCON_CONFIG);
     if (err != ESP_OK) return err;
     // Configure FIFOs and filters
     err = configure_fifos(ctx);
@@ -519,16 +542,25 @@ static esp_err_t iface_stop(can_interface_t *self)
     return ESP_OK;
 }
 
+static esp_err_t consume_tx_event(mcp251xfd_ctx_t *ctx, can_tx_diagnostics_t *diagnostics)
+{
+    // The single-entry TEF starts at the base of controller RAM.
+    uint32_t timestamp;
+    if (read_reg32(ctx, RAM_BASE + 8, &timestamp) == ESP_OK) {
+        portENTER_CRITICAL(&ctx->rx_clock_lock);
+        const mcp251xfd_rx_clock_t clock = ctx->rx_clock;
+        portEXIT_CRITICAL(&ctx->rx_clock_lock);
+        diagnostics->tx_timestamp_us = mcp251xfd_rx_clock_time(&clock, timestamp);
+    }
+    return write_reg32(ctx, REG_C1TEFCON, TEFCON_CONFIG | FIFOCON_UINC);
+}
+
 static esp_err_t iface_poll_tx(can_interface_t *self, bool abort, can_tx_diagnostics_t *diagnostics)
 {
     mcp251xfd_ctx_t *ctx = self->ctx;
     uint32_t events, status;
     if (read_reg32(ctx, REG_C1TEFSTA, &events) != ESP_OK) return ESP_FAIL;
-    if (events & TEFSTA_NOT_EMPTY) {
-        // USB capture owns the single outstanding TX slot, so the event
-        // belongs to its current request. UINC consumes it without timestamps.
-        return write_reg32(ctx, REG_C1TEFCON, TEFCON_TEFNEIE | FIFOCON_UINC);
-    }
+    if (events & TEFSTA_NOT_EMPTY) return consume_tx_event(ctx, diagnostics);
     if (read_reg32(ctx, REG_C1FIFOSTA(2), &status) != ESP_OK) return ESP_FAIL;
     if (!(status & FIFOSTA_TXATIF) && !abort) return ESP_ERR_NOT_FINISHED;
 
@@ -546,7 +578,7 @@ static esp_err_t iface_poll_tx(can_interface_t *self, bool abort, can_tx_diagnos
     // A successful transmission can race an abort. Consume its event
     // before allowing the slot to be reused.
     if (read_reg32(ctx, REG_C1TEFSTA, &events) != ESP_OK) return ESP_FAIL;
-    if (events & TEFSTA_NOT_EMPTY) return write_reg32(ctx, REG_C1TEFCON, TEFCON_TEFNEIE | FIFOCON_UINC);
+    if (events & TEFSTA_NOT_EMPTY) return consume_tx_event(ctx, diagnostics);
 
     if (write_reg32(ctx, REG_C1FIFOCON(2), control | FIFOCON_FRESET) != ESP_OK ||
         read_reg32(ctx, REG_C1FIFOCON(2), &control) != ESP_OK ||
@@ -567,16 +599,13 @@ static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
     if (frame->fd || frame->brs || frame->dlc > 8) return ESP_ERR_NOT_SUPPORTED;
     mcp251xfd_ctx_t *ctx = (mcp251xfd_ctx_t *)self->ctx;
 
-    // Check TX FIFO 2 has space
-    uint32_t fifosta;
-    if (read_reg32(ctx, REG_C1FIFOSTA(2), &fifosta) != ESP_OK) return ESP_FAIL;
-    if (!(fifosta & FIFOSTA_TFNRFNIF)) {
-        return ESP_ERR_NO_MEM;  // TX FIFO full
+    // FIFO status and the next slot address occupy adjacent registers.
+    uint8_t slot[8];
+    if (spi_read_reg(ctx, REG_C1FIFOSTA(2), slot, sizeof(slot)) != ESP_OK) return ESP_FAIL;
+    if (!(read_le32(slot) & FIFOSTA_TFNRFNIF)) {
+        return ESP_ERR_NO_MEM;
     }
-
-    // Get user address for next TX slot
-    uint32_t ua;
-    if (read_reg32(ctx, REG_C1FIFOUA(2), &ua) != ESP_OK) return ESP_FAIL;
+    const uint32_t ua = read_le32(slot + 4);
 
     // Build message object
     uint32_t t0 = frame->id & 0x7FF;
@@ -591,7 +620,8 @@ static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
 
     uint8_t data_len = dlc_to_len(frame->dlc);
     if (frame->rtr) t1 |= (1 << 5);
-    uint8_t msg[72] = {0};
+    // The configured slot is larger, but Classic CAN uses only these bytes.
+    uint8_t msg[16] = {0};
     msg[0] = t0 & 0xFF;
     msg[1] = (t0 >> 8) & 0xFF;
     msg[2] = (t0 >> 16) & 0xFF;
@@ -604,11 +634,9 @@ static esp_err_t iface_send(can_interface_t *self, const can_frame_t *frame)
 
     if (spi_write_reg(ctx, RAM_BASE + ua, msg, sizeof(msg)) != ESP_OK) return ESP_FAIL;
 
-    // Set UINC and TXREQ
-    uint32_t fifocon;
-    if (read_reg32(ctx, REG_C1FIFOCON(2), &fifocon) != ESP_OK) return ESP_FAIL;
-    fifocon |= FIFOCON_UINC | FIFOCON_TXREQ;
-    return write_reg32(ctx, REG_C1FIFOCON(2), fifocon);
+    // FIFO 2 is fixed at runtime. Use the same configuration as initialization
+    // when setting UINC and TXREQ so these bits can be set without a readback.
+    return write_reg32(ctx, REG_C1FIFOCON(2), TX_FIFO_CONFIG | FIFOCON_UINC | FIFOCON_TXREQ);
 }
 
 static void iface_set_rx_callback(can_interface_t *self, can_rx_callback_t cb, void *user_ctx)
@@ -641,6 +669,7 @@ can_interface_t *mcp251xfd_create(const mcp251xfd_config_t *config)
     ctx->rx_cb_ctx = NULL;
     ctx->running = false;
     ctx->int_sem = xSemaphoreCreateBinary();
+    portMUX_INITIALIZE(&ctx->rx_clock_lock);
     ctx->spi_mutex = xSemaphoreCreateMutex();
 
     // Initialize SPI bus

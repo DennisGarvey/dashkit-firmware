@@ -22,12 +22,16 @@ typedef struct {
     uint8_t     bus_id;
     uint32_t    timestamp_us;  // Microseconds since boot (lower 32 bits)
     uint64_t    capture_timestamp_us;  // Controller RX time mapped to ESP uptime
+    int64_t     rx_task_wake_us;
+    bool        rx_task_timeout;
+    uint8_t     rx_fifo;
 } can_tagged_frame_t;
 
 // Callback for received frames
 typedef void (*can_rx_callback_t)(const can_tagged_frame_t *frame, void *user_ctx);
 
 typedef struct {
+    uint64_t tx_timestamp_us;
     uint32_t fifo_status;
     uint32_t bus_diagnostics;
     uint32_t error_counters;

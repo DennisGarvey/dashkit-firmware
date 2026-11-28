@@ -9,3 +9,4 @@ void usb_capture_overflow(uint8_t bus_id);
 void usb_capture_account_spi(uint8_t bus_id, uint32_t clock_bits);
 
 void usb_capture_notify_tx_event(void);
+int usb_capture_automatic_sid(uint8_t bus_id);

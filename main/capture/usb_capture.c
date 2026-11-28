@@ -86,7 +86,34 @@ static struct {
     uint8_t checksum_byte;
     counter_descriptor_t counter;
     int64_t interval, next_repeat, end, lease;
+    int64_t trigger_rx_us, trigger_detected_us, trigger_wake_us;
+    bool trigger_timeout;
+    uint32_t trigger_frames_ahead, trigger_same_fifo_ahead;
+    uint32_t recent_rx_us[32];
+    uint8_t recent_rx_fifo[32];
+    uint8_t recent_rx_next, recent_rx_count;
 } s_repeat;
+
+// Capture-task-owned totals for successful RX-triggered TX requests.
+static struct {
+    uint64_t total[7];
+    uint32_t max[7], count, timeouts;
+    uint64_t tx_total, rx_to_tx_total;
+    uint32_t rx_to_tx_count;
+    uint32_t tx_count, tx_max, arbitration_losses;
+} s_tx_latency[2];
+
+int usb_capture_automatic_sid(uint8_t bus_id)
+{
+    int sid = -1;
+    portENTER_CRITICAL(&s_repeat_lock);
+    if (s_repeat.sequence && s_repeat.automatic && s_repeat.bus == bus_id &&
+        s_repeat.generation == atomic_load_explicit(&s_capture_generation, memory_order_relaxed)) {
+        sid = s_repeat.frame.extended ? s_repeat.frame.id >> 18 : s_repeat.frame.id;
+    }
+    portEXIT_CRITICAL(&s_repeat_lock);
+    return sid;
+}
 
 static void increment_counter(can_frame_t *frame, const counter_descriptor_t *counter)
 {
@@ -113,9 +140,34 @@ static void observe_repeat(const can_tagged_frame_t *received, uint32_t generati
                 wake = changed && !s_repeat.pending;
                 s_repeat.pending = changed;
                 s_repeat.automatic_needs_send = changed;
-                if (!changed) s_repeat.retry_pending = false;
+                if (changed) {
+                    s_repeat.trigger_rx_us = received->capture_timestamp_us;
+                    s_repeat.trigger_detected_us = esp_timer_get_time();
+                    s_repeat.trigger_wake_us = received->rx_task_wake_us;
+                    s_repeat.trigger_timeout = received->rx_task_timeout;
+                    s_repeat.trigger_frames_ahead = 0;
+                    s_repeat.trigger_same_fifo_ahead = 0;
+                    const uint32_t rx_us = received->capture_timestamp_us;
+                    for (unsigned i = 0; i < s_repeat.recent_rx_count; ++i) {
+                        const unsigned at = (s_repeat.recent_rx_next + 31 - i) % 32;
+                        if ((int32_t)(s_repeat.recent_rx_us[at] - rx_us) < 0) break;
+                        ++s_repeat.trigger_frames_ahead;
+                        if (s_repeat.recent_rx_fifo[at] == received->rx_fifo)
+                            ++s_repeat.trigger_same_fifo_ahead;
+                    }
+                } else {
+                    s_repeat.retry_pending = false;
+                    s_repeat.trigger_rx_us = 0;
+                }
             }
         }
+    }
+    if (s_repeat.automatic && s_repeat.sequence && s_repeat.generation == generation &&
+        received->bus_id == s_repeat.bus) {
+        s_repeat.recent_rx_us[s_repeat.recent_rx_next] = esp_timer_get_time();
+        s_repeat.recent_rx_fifo[s_repeat.recent_rx_next] = received->rx_fifo;
+        s_repeat.recent_rx_next = (s_repeat.recent_rx_next + 1) % 32;
+        if (s_repeat.recent_rx_count < 32) ++s_repeat.recent_rx_count;
     }
     portEXIT_CRITICAL(&s_repeat_lock);
     if (wake) usb_capture_notify_tx_event();
@@ -228,6 +280,7 @@ static void stop_capture_session(void)
     set_capture_generation(0);
     s_session_id = 0;
     s_output.size = 0;
+    memset(s_tx_latency, 0, sizeof(s_tx_latency));
     xQueueReset(s_queue);
     xQueueReset(s_usb_output_queue);
     if (s_repeat.sequence && !s_repeat.finish_status)
@@ -282,7 +335,7 @@ void usb_capture_enable_tx(void)
 static int64_t s_next_manual_send;
 static struct {
     can_frame_t frame;
-    int64_t deadline;
+    int64_t deadline, requested_us, trigger_rx_us;
     uint32_t sequence, generation;
     uint8_t bus;
 } s_pending_tx;
@@ -295,7 +348,8 @@ static void write_tx_result(uint8_t type, uint8_t bus, uint32_t sequence, uint8_
     write_record(raw, 21);
 }
 
-static uint8_t send_frame(uint8_t bus, const can_frame_t *frame, uint32_t sequence)
+static uint8_t send_frame(uint8_t bus, const can_frame_t *frame, uint32_t sequence,
+                          int64_t trigger_rx_us, int64_t *requested_us)
 {
     if (s_pending_tx.deadline) return DK_TX_FIFO_FULL;
     esp_err_t result = can_manager_send(bus, frame);
@@ -304,7 +358,11 @@ static uint8_t send_frame(uint8_t bus, const can_frame_t *frame, uint32_t sequen
         s_pending_tx.bus = bus;
         s_pending_tx.sequence = sequence;
         s_pending_tx.generation = s_next_generation;
-        s_pending_tx.deadline = esp_timer_get_time() + 100000;
+        const int64_t queued_us = esp_timer_get_time();
+        s_pending_tx.requested_us = queued_us;
+        s_pending_tx.trigger_rx_us = trigger_rx_us;
+        s_pending_tx.deadline = queued_us + 100000;
+        if (requested_us) *requested_us = queued_us;
         return DK_TX_QUEUED;
     }
     if (result == ESP_ERR_NO_MEM) return DK_TX_FIFO_FULL;
@@ -322,7 +380,14 @@ static void update_repeat_stop(int64_t now)
     }
 }
 
-static void service_tx_feedback(void)
+typedef struct {
+    can_frame_t frame;
+    uint64_t timestamp_us;
+    uint32_t sequence;
+    uint8_t bus;
+} successful_tx_report_t;
+
+static void service_tx_feedback(successful_tx_report_t *report)
 {
     if (!s_pending_tx.deadline) return;
     const uint32_t generation = atomic_load_explicit(&s_capture_generation, memory_order_relaxed);
@@ -348,11 +413,31 @@ static void service_tx_feedback(void)
         portEXIT_CRITICAL(&s_lock);
     }
     if (!sequence || session_ended) return;
-    if (result == ESP_OK) {
-        write_can_frame(DK_TX_FRAME, bus, sequence, esp_timer_get_time(), &s_pending_tx.frame);
-    }
     const bool timed = sequence == s_repeat.sequence;
+    if (timed && s_repeat.automatic && result == ESP_OK && diagnostics.tx_timestamp_us) {
+        const int64_t delay = (int64_t)diagnostics.tx_timestamp_us - s_pending_tx.requested_us;
+        // The controller can start sending before the SPI write returns.
+        const uint32_t elapsed = delay > 0 ? delay : 0;
+        s_tx_latency[bus].tx_total += elapsed;
+        if (elapsed > s_tx_latency[bus].tx_max) s_tx_latency[bus].tx_max = elapsed;
+        ++s_tx_latency[bus].tx_count;
+        if (s_pending_tx.trigger_rx_us > 0 &&
+            diagnostics.tx_timestamp_us >= (uint64_t)s_pending_tx.trigger_rx_us) {
+            s_tx_latency[bus].rx_to_tx_total += diagnostics.tx_timestamp_us - s_pending_tx.trigger_rx_us;
+            ++s_tx_latency[bus].rx_to_tx_count;
+        }
+    }
+    if (result == ESP_OK) {
+        *report = (successful_tx_report_t) {
+            .frame = s_pending_tx.frame,
+            .timestamp_us = esp_timer_get_time(),
+            .sequence = sequence,
+            .bus = bus,
+        };
+        return;
+    }
     if (timed && result == ESP_ERR_TIMEOUT && diagnostics.arbitration_only) {
+        if (s_repeat.automatic) ++s_tx_latency[bus].arbitration_losses;
         if (!stopping) {
             portENTER_CRITICAL(&s_repeat_lock);
             s_repeat.retry_pending = !s_repeat.automatic || s_repeat.automatic_needs_send;
@@ -362,9 +447,8 @@ static void service_tx_feedback(void)
     }
     // A deliberate abort may clear a pending frame without an outcome.
     if (stopping && result == ESP_ERR_INVALID_RESPONSE) return;
-    const uint8_t feedback = result == ESP_OK ? DK_TX_ACKNOWLEDGED :
-                             result == ESP_ERR_TIMEOUT ? DK_TX_UNCONFIRMED : DK_TX_OUTCOME_UNKNOWN;
-    if (feedback != DK_TX_ACKNOWLEDGED && diagnostics.valid) {
+    const uint8_t feedback = result == ESP_ERR_TIMEOUT ? DK_TX_UNCONFIRMED : DK_TX_OUTCOME_UNKNOWN;
+    if (diagnostics.valid) {
         uint8_t raw[DK_MAX_RAW];
         common_header(raw, DK_TX_FEEDBACK, bus, sequence, esp_timer_get_time());
         raw[20] = feedback;
@@ -375,7 +459,7 @@ static void service_tx_feedback(void)
     } else {
         write_tx_result(DK_TX_FEEDBACK, bus, sequence, feedback);
     }
-    if (sequence == s_repeat.sequence && feedback != DK_TX_ACKNOWLEDGED && !s_repeat.finish_status)
+    if (timed && !s_repeat.finish_status)
         s_repeat.finish_status = feedback == DK_TX_UNCONFIRMED ? DK_TX_PREVIOUS_FAILED : DK_TX_CONTROLLER_ERROR;
 }
 
@@ -393,17 +477,19 @@ static void finish_repeat(uint8_t status)
                         bus, sequence, status);
 }
 
-static void service_repeat(void)
+static uint8_t service_repeat(void)
 {
     int64_t now = esp_timer_get_time();
-    if (!s_repeat.sequence) return;
+    if (!s_repeat.sequence) return 0;
     update_repeat_stop(now);
     if (s_repeat.finish_status) {
-        if (!s_pending_tx.sequence) finish_repeat(s_repeat.finish_status);
-        return;
+        return s_pending_tx.sequence ? 0 : s_repeat.finish_status;
     }
-    if (s_pending_tx.deadline) return;
+    if (s_pending_tx.deadline) return 0;
     can_frame_t frame;
+    int64_t rx_us = 0, detected_us = 0, wake_us = 0, tx_trigger_us = 0;
+    bool timeout = false;
+    uint32_t frames_ahead = 0, same_fifo_ahead = 0;
     portENTER_CRITICAL(&s_repeat_lock);
     const bool due = s_repeat.retry_pending ||
                      (s_repeat.automatic ? s_repeat.pending : now >= s_repeat.next_repeat);
@@ -413,18 +499,46 @@ static void service_repeat(void)
         if (s_repeat.recalculate_checksum)
             dk_recalculate_tesla_checksum(frame.data, s_lengths[frame.dlc], frame.id,
                                           s_repeat.checksum_byte);
+        rx_us = s_repeat.trigger_rx_us;
+        // A software retry keeps the original trigger unless newer RX replaced it.
+        tx_trigger_us = rx_us;
+        if (!tx_trigger_us && s_repeat.retry_pending && s_repeat.automatic)
+            tx_trigger_us = s_pending_tx.trigger_rx_us;
+        detected_us = s_repeat.trigger_detected_us;
+        wake_us = s_repeat.trigger_wake_us;
+        timeout = s_repeat.trigger_timeout;
+        frames_ahead = s_repeat.trigger_frames_ahead;
+        same_fifo_ahead = s_repeat.trigger_same_fifo_ahead;
+        s_repeat.trigger_rx_us = 0;
         s_repeat.pending = false;
         s_repeat.retry_pending = false;
     }
     portEXIT_CRITICAL(&s_repeat_lock);
-    if (!due) return;
+    if (!due) return 0;
 
-    uint8_t result = send_frame(s_repeat.bus, &frame, s_repeat.sequence);
+    int64_t requested_us;
+    uint8_t result = send_frame(s_repeat.bus, &frame, s_repeat.sequence, tx_trigger_us, &requested_us);
     if (result == DK_TX_QUEUED) {
         if (!s_repeat.automatic) s_repeat.next_repeat = now + s_repeat.interval;
+        if (rx_us > 0 && rx_us <= detected_us) {
+            // Frames can arrive during a drain that is already in progress.
+            const int64_t drain_start_us = wake_us > rx_us ? wake_us : rx_us;
+            const uint32_t stages[] = {detected_us - rx_us, requested_us - detected_us,
+                                       drain_start_us - rx_us, detected_us - drain_start_us,
+                                       frames_ahead, same_fifo_ahead,
+                                       frames_ahead - same_fifo_ahead};
+            const uint8_t bus = s_repeat.bus;
+            for (size_t i = 0; i < sizeof(stages) / sizeof(stages[0]); ++i) {
+                s_tx_latency[bus].total[i] += stages[i];
+                if (stages[i] > s_tx_latency[bus].max[i]) s_tx_latency[bus].max[i] = stages[i];
+            }
+            ++s_tx_latency[bus].count;
+            if (timeout && wake_us > rx_us) ++s_tx_latency[bus].timeouts;
+        }
     } else {
-        finish_repeat(result);
+        return result;
     }
+    return 0;
 }
 
 
@@ -523,6 +637,9 @@ static void read_usb_requests(void)
             s_repeat.pending = true;
             s_repeat.retry_pending = false;
             s_repeat.automatic_needs_send = true;
+            s_repeat.recent_rx_count = 0;
+            s_repeat.recent_rx_next = 0;
+            s_repeat.trigger_rx_us = 0;
             s_repeat.increment_counter = increment;
             s_repeat.counter = counter;
             s_repeat.recalculate_checksum = checksum;
@@ -541,7 +658,7 @@ static void read_usb_requests(void)
             if (checksum)
                 dk_recalculate_tesla_checksum(frame.data, s_lengths[frame.dlc], frame.id,
                                               checksum_byte);
-            uint8_t status = send_frame(bus, &frame, sequence);
+            uint8_t status = send_frame(bus, &frame, sequence, 0, NULL);
             write_tx_result(result_type, bus, sequence, status);
         }
     }
@@ -594,6 +711,37 @@ static void write_utilization(int64_t now)
     memcpy(previous_idle, idle, sizeof(previous_idle));
 }
 
+static void write_tx_latency(uint8_t bus, int64_t now)
+{
+    const uint32_t count = s_tx_latency[bus].count;
+    const uint32_t tx_count = s_tx_latency[bus].tx_count;
+    const uint32_t losses = s_tx_latency[bus].arbitration_losses;
+    if (!count && !tx_count && !losses) return;
+    uint8_t raw[DK_MAX_RAW];
+    common_header(raw, DK_TX_LATENCY, bus, 0, now);
+    dk_put(raw + 20, count, 4);
+    for (size_t i = 0; i < 4; ++i) {
+        dk_put(raw + 24 + 8 * i, count ? s_tx_latency[bus].total[i] / count : 0, 4);
+        dk_put(raw + 28 + 8 * i, s_tx_latency[bus].max[i], 4);
+    }
+    dk_put(raw + 56, s_tx_latency[bus].timeouts, 4);
+    dk_put(raw + 60, count ? s_tx_latency[bus].total[4] / count : 0, 4);
+    dk_put(raw + 64, s_tx_latency[bus].max[4], 4);
+    dk_put(raw + 68, tx_count, 4);
+    dk_put(raw + 72, tx_count ? s_tx_latency[bus].tx_total / tx_count : 0, 4);
+    dk_put(raw + 76, s_tx_latency[bus].tx_max, 4);
+    dk_put(raw + 80, losses, 4);
+    const uint32_t rx_to_tx_count = s_tx_latency[bus].rx_to_tx_count;
+    dk_put(raw + 84, rx_to_tx_count, 4);
+    dk_put(raw + 88, rx_to_tx_count ? s_tx_latency[bus].rx_to_tx_total / rx_to_tx_count : 0, 4);
+    for (size_t i = 0; i < 2; ++i) {
+        dk_put(raw + 92 + 8 * i, count ? s_tx_latency[bus].total[5 + i] / count : 0, 4);
+        dk_put(raw + 96 + 8 * i, s_tx_latency[bus].max[5 + i], 4);
+    }
+    write_record(raw, DK_TX_LATENCY_SIZE);
+    memset(&s_tx_latency[bus], 0, sizeof(s_tx_latency[bus]));
+}
+
 static void capture_task(void *arg)
 {
     (void)arg;
@@ -605,8 +753,16 @@ static void capture_task(void *arg)
         if (s_session_id && loop_time >= s_session_deadline) stop_capture_session();
         read_usb_requests();
         update_repeat_stop(esp_timer_get_time());
-        service_tx_feedback();
-        service_repeat();
+        successful_tx_report_t report;
+        report.sequence = 0;
+        service_tx_feedback(&report);
+        const uint8_t finish_status = service_repeat();
+        if (report.sequence) {
+            write_can_frame(DK_TX_FRAME, report.bus, report.sequence, report.timestamp_us, &report.frame);
+            write_tx_result(DK_TX_FEEDBACK, report.bus, report.sequence, DK_TX_ACKNOWLEDGED);
+        }
+        // Finish after reporting the prior success, even if the next send failed.
+        if (finish_status) finish_repeat(finish_status);
         const bool timed = s_pending_tx.deadline || s_repeat.sequence;
         if (xQueueReceive(s_queue, &item, timed ? 0 : pdMS_TO_TICKS(2)) == pdTRUE) {
             if (item.generation == atomic_load_explicit(&s_capture_generation, memory_order_relaxed))
@@ -628,6 +784,7 @@ static void capture_task(void *arg)
                 portEXIT_CRITICAL(&s_lock);
                 dk_put(raw + 28, atomic_load_explicit(&s_usb_aborts, memory_order_relaxed), 4);
                 write_record(raw, DK_STATUS_SIZE);
+                write_tx_latency(bus, now);
             }
             if (atomic_load(&s_tx_ready)) {
                 write_tx_result(DK_TX_RESULT, DK_TX_CAPABILITY, 0, DK_TX_READY);

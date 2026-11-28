@@ -227,5 +227,14 @@ int main(void)
     }
     dk_put(raw + 12, 0, 8);
     assert(dk_decode(wire, dk_encode(raw, 21, wire) - 1, decoded) == 0);
+    memset(raw, 0, sizeof(raw));
+    raw[0] = DK_VERSION;
+    raw[1] = DK_TX_LATENCY;
+    raw[2] = 1;
+    assert(dk_decode(wire, dk_encode(raw, DK_TX_LATENCY_SIZE, wire) - 1, decoded) == 0);
+    dk_put(raw + 20, 5, 4);
+    dk_put(raw + 36, 1234, 4);
+    assert(dk_decode(wire, dk_encode(raw, DK_TX_LATENCY_SIZE, wire) - 1, decoded) == DK_TX_LATENCY_SIZE + 2);
+    assert(dk_get(decoded + 36, 4) == 1234);
     puts("Capture protocol: frame roundtrips, corruption, masked timed modes, status, and truncation passed");
 }

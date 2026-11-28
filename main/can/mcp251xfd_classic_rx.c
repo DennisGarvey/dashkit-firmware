@@ -21,7 +21,7 @@
 #define FIFO_RX_CONFIG  (((MCP_CLASSIC_FIFO_DEPTH - 1u) << 24) | MCP251XFD_RX_TIMESTAMP_ENABLE | FIFO_NOT_EMPTY)
 
 #define LANE_SHIFT      4
-#define TEF_BYTES       8
+#define TEF_BYTES       12
 #define USB_TX_BYTES    72
 #define PASSIVE_TX_BYTES (4 * 16)
 #define LANE_BYTES      (MCP_CLASSIC_FIFO_DEPTH * MCP_CLASSIC_RX_BYTES)
@@ -64,6 +64,7 @@ esp_err_t mcp251xfd_classic_configure(mcp251xfd_classic_rx_t *rx)
 esp_err_t mcp251xfd_classic_reset(mcp251xfd_classic_rx_t *rx)
 {
     rx->next_lane = 0;
+    rx->prefer_other_lane = false;
     for (unsigned lane = 0; lane < MCP_CLASSIC_FIFO_COUNT; ++lane) {
         esp_err_t err = rx->write(rx->io, REG_C1FIFOCON(fifo_for_lane(lane)), FIFO_RX_CONFIG | FIFO_RESET);
         if (err != ESP_OK) return err;
@@ -71,7 +72,7 @@ esp_err_t mcp251xfd_classic_reset(mcp251xfd_classic_rx_t *rx)
     return ESP_OK;
 }
 
-static void deliver_frame(mcp251xfd_classic_rx_t *rx, const uint8_t *object)
+static void deliver_frame(mcp251xfd_classic_rx_t *rx, const uint8_t *object, uint8_t fifo)
 {
     const uint32_t id = read_le32(object);
     const uint32_t header = read_le32(object + 4);
@@ -86,7 +87,7 @@ static void deliver_frame(mcp251xfd_classic_rx_t *rx, const uint8_t *object)
     };
     if (frame.extended) frame.id = (frame.id << 18) | ((id >> 11) & 0x3ffff);
     if (!frame.rtr) memcpy(frame.data, object + 12, frame.dlc);
-    rx->deliver(rx->io, &frame, read_le32(object + 8));
+    rx->deliver(rx->io, &frame, read_le32(object + 8), fifo);
 }
 
 static bool drain_lane(mcp251xfd_classic_rx_t *rx, unsigned lane)
@@ -121,27 +122,44 @@ static bool drain_lane(mcp251xfd_classic_rx_t *rx, unsigned lane)
     unsigned released = 0;
     while (released < count &&
            rx->write(rx->io, REG_C1FIFOCON(fifo), FIFO_RX_CONFIG | FIFO_INCREMENT) == ESP_OK) {
+        deliver_frame(rx, objects + released * MCP_CLASSIC_RX_BYTES, fifo);
         ++released;
-    }
-    for (unsigned i = 0; i < released; ++i) {
-        deliver_frame(rx, objects + i * MCP_CLASSIC_RX_BYTES);
     }
     return released != 0;
 }
 
-bool mcp251xfd_classic_drain(mcp251xfd_classic_rx_t *rx)
+bool mcp251xfd_classic_drain(mcp251xfd_classic_rx_t *rx, int preferred_sid)
 {
     uint8_t flags[4];
     if (rx->read(rx->io, REG_C1RXIF, flags, sizeof(flags)) != ESP_OK) return false;
 
-    const uint32_t pending = read_le32(flags);
+    return mcp251xfd_classic_drain_pending(rx, preferred_sid, read_le32(flags));
+}
+
+bool mcp251xfd_classic_drain_pending(mcp251xfd_classic_rx_t *rx, int preferred_sid, uint32_t pending)
+{
+    // The acceptance filters use the same SID bits for both frame formats.
+    const unsigned preferred = preferred_sid < 0 ? MCP_CLASSIC_FIFO_COUNT :
+                               ((unsigned)preferred_sid >> LANE_SHIFT) % MCP_CLASSIC_FIFO_COUNT;
+    const bool pending_preferred = preferred < MCP_CLASSIC_FIFO_COUNT &&
+                                   (pending & (1u << fifo_for_lane(preferred)));
+    const bool try_preferred_first = pending_preferred && !rx->prefer_other_lane;
+    if (try_preferred_first && drain_lane(rx, preferred)) {
+        rx->prefer_other_lane = true;
+        return true;
+    }
+
     const unsigned first_lane = rx->next_lane;
     for (unsigned i = 0; i < MCP_CLASSIC_FIFO_COUNT; ++i) {
         const unsigned lane = (first_lane + i) % MCP_CLASSIC_FIFO_COUNT;
-        if ((pending & (1u << fifo_for_lane(lane))) && drain_lane(rx, lane)) {
+        if (lane != preferred && (pending & (1u << fifo_for_lane(lane))) && drain_lane(rx, lane)) {
+            rx->prefer_other_lane = false;
             rx->next_lane = (lane + 1) % MCP_CLASSIC_FIFO_COUNT;
             return true;
         }
     }
+    // If the other lanes had nothing to service, keep draining the preferred lane.
+    if (pending_preferred && !try_preferred_first && drain_lane(rx, preferred)) return true;
+    rx->prefer_other_lane = false;
     return false;
 }

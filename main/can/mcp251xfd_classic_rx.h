@@ -14,12 +14,14 @@ typedef struct {
     void *io;
     esp_err_t (*read)(void *io, uint16_t addr, uint8_t *data, size_t len);
     esp_err_t (*write)(void *io, uint16_t addr, uint32_t value);
-    void (*deliver)(void *io, const can_frame_t *frame, uint32_t counter);
+    void (*deliver)(void *io, const can_frame_t *frame, uint32_t counter, uint8_t fifo);
     void (*overflow)(void *io);
     bool has_tx_event;
     uint8_t next_lane;
+    bool prefer_other_lane;
 } mcp251xfd_classic_rx_t;
 
 esp_err_t mcp251xfd_classic_configure(mcp251xfd_classic_rx_t *rx);
 esp_err_t mcp251xfd_classic_reset(mcp251xfd_classic_rx_t *rx);
-bool mcp251xfd_classic_drain(mcp251xfd_classic_rx_t *rx);
+bool mcp251xfd_classic_drain_pending(mcp251xfd_classic_rx_t *rx, int preferred_sid, uint32_t pending);
+bool mcp251xfd_classic_drain(mcp251xfd_classic_rx_t *rx, int preferred_sid);
