@@ -215,6 +215,43 @@ Type 3 uses codes 0–6. Types 6 and 8 use codes 2–11 for request results.
 The v1 decoder also recognizes zero-sequence readiness announcements in
 types 8 and 10. The current firmware announces readiness using type 3.
 
+### Automatic transmit diagnostics (14), device to host
+
+The bus field identifies the physical bus. Flags and sequence are zero,
+and the timestamp marks the end of the reporting interval. Decoded length
+is 110 bytes including CRC. The firmware emits this record when the
+interval has an RX-triggered request, a timestamped success, or an
+arbitration-only loss. The fields below are interval statistics.
+
+- Byte 20: successful queue submissions with an eligible RX trigger.
+- Bytes 24, 28: mean and peak from received frame start to overwrite detection.
+- Bytes 32, 36: mean and peak from detection to the controller transmit request.
+- Bytes 40, 44: mean and peak from frame start to receive-task wake. The wait
+  is zero if the task was already awake when the frame started.
+- Bytes 48, 52: mean and peak from receive-task wake (or frame start when
+  already awake) to overwrite detection.
+- Byte 56: RX-triggered samples whose frame had already started when the
+  receive task woke on its polling timeout.
+- Bytes 60, 64: mean and peak number of same-bus frames delivered between
+  the trigger's frame start and overwrite detection, up to 32 per sample.
+- Byte 68: successful transmit attempts with a hardware TX timestamp.
+- Bytes 72, 76: mean and peak from the successful attempt's transmit request
+  to its hardware TX timestamp.
+- Byte 80: attempts that exhausted the hardware attempt limit and reported
+  arbitration loss alone.
+- Bytes 84, 88: count and mean time for successful corrections with paired
+  RX and hardware TX timestamps, measured from the triggering frame start.
+- Bytes 92, 96: mean and peak of the frames delivered ahead from the
+  trigger's own FIFO.
+- Bytes 100, 104: mean and peak of the frames delivered ahead from
+  other FIFOs.
+
+Each listed byte offset is the start of a little-endian `u32`. Durations
+are in microseconds. Means are truncated to integers, and a timing group
+with zero samples has zero mean and peak. Queue and successful transmit
+samples can fall in different intervals. Use the directly paired measurement
+at byte 88 for end-to-end averages.
+
 ## Test vectors
 
 A START for session ID 1, including the optional leading delimiter and
